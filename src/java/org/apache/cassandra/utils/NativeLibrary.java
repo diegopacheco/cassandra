@@ -30,6 +30,10 @@ import org.slf4j.LoggerFactory;
 
 import com.sun.jna.LastErrorException;
 
+import org.apache.cassandra.io.FSWriteError;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.OS_ARCH;
+import static org.apache.cassandra.config.CassandraRelevantProperties.OS_NAME;
 import static org.apache.cassandra.utils.NativeLibrary.OSType.LINUX;
 import static org.apache.cassandra.utils.NativeLibrary.OSType.MAC;
 import static org.apache.cassandra.utils.NativeLibrary.OSType.WINDOWS;
@@ -99,7 +103,7 @@ public final class NativeLibrary
             default: wrappedLibrary = new NativeLibraryLinux();
         }
 
-        if (System.getProperty("os.arch").toLowerCase().contains("ppc"))
+        if (OS_ARCH.getString().toLowerCase().contains("ppc"))
         {
             if (osType == LINUX)
             {
@@ -131,7 +135,7 @@ public final class NativeLibrary
      */
     private static OSType getOsType()
     {
-        String osName = System.getProperty("os.name").toLowerCase();
+        String osName = OS_NAME.getString().toLowerCase();
         if  (osName.contains("linux"))
             return LINUX;
         else if (osName.contains("mac"))
@@ -196,7 +200,7 @@ public final class NativeLibrary
             {
                 logger.warn("Unable to lock JVM memory (ENOMEM)."
                         + " This can result in part of the JVM being swapped out, especially with mmapped I/O enabled."
-                        + " Increase RLIMIT_MEMLOCK or run Cassandra as root.");
+                        + " Increase RLIMIT_MEMLOCK.");
             }
             else if (osType != MAC)
             {
@@ -335,7 +339,9 @@ public final class NativeLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn("fsync({}) failed, errorno ({}) {}", fd, errno(e), e.getMessage());
+            String errMsg = String.format("fsync(%s) failed, errno (%s) %s", fd, errno(e), e.getMessage());
+            logger.warn(errMsg);
+            throw new FSWriteError(e, errMsg);
         }
     }
 
@@ -357,7 +363,9 @@ public final class NativeLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn("close({}) failed, errno ({}).", fd, errno(e));
+            String errMsg = String.format("close(%d) failed, errno (%d).", fd, errno(e));
+            logger.warn(errMsg);
+            throw new FSWriteError(e, errMsg);
         }
     }
 

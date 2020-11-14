@@ -21,14 +21,17 @@ package org.apache.cassandra;
 
 import java.io.Closeable;
 import java.io.EOFException;
+import java.io.File;
 import java.io.IOError;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import com.google.common.base.Function;
 import com.google.common.base.Preconditions;
@@ -36,12 +39,17 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
 import org.apache.commons.lang3.StringUtils;
 
-import org.junit.Assert;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import afu.org.checkerframework.checker.oigj.qual.O;
+import org.apache.cassandra.db.compaction.ActiveCompactionsTracker;
+import org.apache.cassandra.db.compaction.CompactionTasks;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.ReplicaCollection;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
@@ -73,6 +81,7 @@ import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CounterId;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.FilterFactory;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -116,7 +125,7 @@ public class Util
         return PartitionPosition.ForKey.get(ByteBufferUtil.bytes(key), partitioner);
     }
 
-    public static Clustering clustering(ClusteringComparator comparator, Object... o)
+    public static Clustering<?> clustering(ClusteringComparator comparator, Object... o)
     {
         return comparator.make(o);
     }
@@ -216,7 +225,7 @@ public class Util
         for (int i=0; i<endpointTokens.size(); i++)
         {
             InetAddressAndPort ep = InetAddressAndPort.getByName("127.0.0." + String.valueOf(i + 1));
-            Gossiper.instance.initializeNodeUnsafe(ep, hostIds.get(i), 1);
+            Gossiper.instance.initializeNodeUnsafe(ep, hostIds.get(i), MessagingService.current_version, 1);
             Gossiper.instance.injectApplicationState(ep, ApplicationState.TOKENS, new VersionedValue.VersionedValueFactory(partitioner).tokens(Collections.singleton(endpointTokens.get(i))));
             ss.onChange(ep,
                         ApplicationState.STATUS_WITH_PORT,
@@ -243,9 +252,11 @@ public class Util
     public static void compact(ColumnFamilyStore cfs, Collection<SSTableReader> sstables)
     {
         int gcBefore = cfs.gcBefore(FBUtilities.nowInSeconds());
-        List<AbstractCompactionTask> tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstables, gcBefore);
-        for (AbstractCompactionTask task : tasks)
-            task.execute(null);
+        try (CompactionTasks tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstables, gcBefore))
+        {
+            for (AbstractCompactionTask task : tasks)
+                task.execute(ActiveCompactionsTracker.NOOP);
+        }
     }
 
     public static void expectEOF(Callable<?> callable)
@@ -423,7 +434,7 @@ public class Util
         return mutation.getPartitionUpdates().iterator().next().unfilteredIterator();
     }
 
-    public static Cell cell(ColumnFamilyStore cfs, Row row, String columnName)
+    public static Cell<?> cell(ColumnFamilyStore cfs, Row row, String columnName)
     {
         ColumnMetadata def = cfs.metadata().getColumn(ByteBufferUtil.bytes(columnName));
         assert def != null;
@@ -437,9 +448,9 @@ public class Util
 
     public static void assertCellValue(Object value, ColumnFamilyStore cfs, Row row, String columnName)
     {
-        Cell cell = cell(cfs, row, columnName);
+        Cell<?> cell = cell(cfs, row, columnName);
         assert cell != null : "Row " + row.toString(cfs.metadata()) + " has no cell for " + columnName;
-        assertEquals(value, cell.column().type.compose(cell.value()));
+        assertEquals(value, Cells.composeValue(cell, cell.column().type));
     }
 
     public static void consume(UnfilteredRowIterator iter)
@@ -516,10 +527,10 @@ public class Util
     // moved & refactored from KeyspaceTest in < 3.0
     public static void assertColumns(Row row, String... expectedColumnNames)
     {
-        Iterator<Cell> cells = row == null ? Collections.emptyIterator() : row.cells().iterator();
-        String[] actual = Iterators.toArray(Iterators.transform(cells, new Function<Cell, String>()
+        Iterator<Cell<?>> cells = row == null ? Collections.emptyIterator() : row.cells().iterator();
+        String[] actual = Iterators.toArray(Iterators.transform(cells, new Function<Cell<?>, String>()
         {
-            public String apply(Cell cell)
+            public String apply(Cell<?> cell)
             {
                 return cell.column().name.toString();
             }
@@ -533,14 +544,14 @@ public class Util
 
     public static void assertColumn(TableMetadata cfm, Row row, String name, String value, long timestamp)
     {
-        Cell cell = row.getCell(cfm.getColumn(new ColumnIdentifier(name, true)));
+        Cell<?> cell = row.getCell(cfm.getColumn(new ColumnIdentifier(name, true)));
         assertColumn(cell, value, timestamp);
     }
 
-    public static void assertColumn(Cell cell, String value, long timestamp)
+    public static void assertColumn(Cell<?> cell, String value, long timestamp)
     {
         assertNotNull(cell);
-        assertEquals(0, ByteBufferUtil.compareUnsigned(cell.value(), ByteBufferUtil.bytes(value)));
+        assertEquals(0, ByteBufferUtil.compareUnsigned(cell.buffer(), ByteBufferUtil.bytes(value)));
         assertEquals(timestamp, cell.timestamp());
     }
 
@@ -573,18 +584,24 @@ public class Util
         }
     }
 
-    public static void spinAssertEquals(Object expected, Supplier<Object> s, int timeoutInSeconds)
+    public static void spinAssertEquals(Object expected, Supplier<Object> actualSupplier, int timeoutInSeconds)
     {
-        long start = System.currentTimeMillis();
-        Object lastValue = null;
-        while (System.currentTimeMillis() < start + (1000 * timeoutInSeconds))
+        spinAssertEquals(null, expected, actualSupplier, timeoutInSeconds, TimeUnit.SECONDS);
+    }
+
+    public static <T> void spinAssertEquals(String message, T expected, Supplier<? extends T> actualSupplier, long timeout, TimeUnit timeUnit)
+    {
+        long startNano = System.nanoTime();
+        long expireAtNano = startNano + timeUnit.toNanos(timeout);
+        T actual = null;
+        while (System.nanoTime() < expireAtNano)
         {
-            lastValue = s.get();
-            if (lastValue.equals(expected))
+            actual = actualSupplier.get();
+            if (actual.equals(expected))
                 break;
             Thread.yield();
         }
-        assertEquals(expected, lastValue);
+        assertEquals(message, expected, actual);
     }
 
     public static void joinThread(Thread thread) throws InterruptedException
@@ -692,17 +709,22 @@ public class Util
             for ( ; ; )
             {
                 DataDirectory dir = cfs.getDirectories().getWriteableLocation(1);
-                BlacklistedDirectories.maybeMarkUnwritable(cfs.getDirectories().getLocationForDisk(dir));
+                DisallowedDirectories.maybeMarkUnwritable(cfs.getDirectories().getLocationForDisk(dir));
             }
         }
         catch (IOError e)
         {
             // Expected -- marked all directories as unwritable
         }
-        return () -> BlacklistedDirectories.clearUnwritableUnsafe();
+        return () -> DisallowedDirectories.clearUnwritableUnsafe();
     }
 
     public static PagingState makeSomePagingState(ProtocolVersion protocolVersion)
+    {
+        return makeSomePagingState(protocolVersion, Integer.MAX_VALUE);
+    }
+
+    public static PagingState makeSomePagingState(ProtocolVersion protocolVersion, int remainingInPartition)
     {
         TableMetadata metadata =
             TableMetadata.builder("ks", "tbl")
@@ -715,10 +737,10 @@ public class Util
         ByteBuffer pk = ByteBufferUtil.bytes("someKey");
 
         ColumnMetadata def = metadata.getColumn(new ColumnIdentifier("myCol", false));
-        Clustering c = Clustering.make(ByteBufferUtil.bytes("c1"), ByteBufferUtil.bytes(42));
+        Clustering<?> c = Clustering.make(ByteBufferUtil.bytes("c1"), ByteBufferUtil.bytes(42));
         Row row = BTreeRow.singleCellRow(c, BufferCell.live(def, 0, ByteBufferUtil.EMPTY_BYTE_BUFFER));
         PagingState.RowMark mark = PagingState.RowMark.create(metadata, row, protocolVersion);
-        return new PagingState(pk, mark, 10, 0);
+        return new PagingState(pk, mark, 10, remainingInPartition);
     }
 
     public static void assertRCEquals(ReplicaCollection<?> a, ReplicaCollection<?> b)
@@ -729,5 +751,50 @@ public class Util
     public static void assertNotRCEquals(ReplicaCollection<?> a, ReplicaCollection<?> b)
     {
         assertFalse(a + " equal to " + b, Iterables.elementsEqual(a, b));
+    }
+
+    /**
+     * Makes sure that the sstables on disk are the same ones as the cfs live sstables (that they have the same generation)
+     */
+    public static void assertOnDiskState(ColumnFamilyStore cfs, int expectedSSTableCount)
+    {
+        LifecycleTransaction.waitForDeletions();
+        assertEquals(expectedSSTableCount, cfs.getLiveSSTables().size());
+        Set<Integer> liveGenerations = cfs.getLiveSSTables().stream().map(sstable -> sstable.descriptor.generation).collect(Collectors.toSet());
+        int fileCount = 0;
+        for (File f : cfs.getDirectories().getCFDirectories())
+        {
+            for (File sst : f.listFiles())
+            {
+                if (sst.getName().contains("Data"))
+                {
+                    Descriptor d = Descriptor.fromFilename(sst.getAbsolutePath());
+                    assertTrue(liveGenerations.contains(d.generation));
+                    fileCount++;
+                }
+            }
+        }
+        assertEquals(expectedSSTableCount, fileCount);
+    }
+
+    /**
+     * Disable bloom filter on all sstables of given table
+     */
+    public static void disableBloomFilter(ColumnFamilyStore cfs)
+    {
+        Collection<SSTableReader> sstables = cfs.getLiveSSTables();
+        try (LifecycleTransaction txn = cfs.getTracker().tryModify(sstables, OperationType.UNKNOWN))
+        {
+            for (SSTableReader sstable : sstables)
+            {
+                sstable = sstable.cloneAndReplace(FilterFactory.AlwaysPresent);
+                txn.update(sstable, true);
+                txn.checkpoint();
+            }
+            txn.finish();
+        }
+
+        for (SSTableReader reader : cfs.getLiveSSTables())
+            assertEquals(FilterFactory.AlwaysPresent, reader.getBloomFilter());
     }
 }

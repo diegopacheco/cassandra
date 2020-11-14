@@ -47,6 +47,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.StatusLogger;
 
 public class GCInspector implements NotificationListener, GCInspectorMXBean
@@ -69,7 +70,16 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
         try
         {
             Class<?> bitsClass = Class.forName("java.nio.Bits");
-            Field f = bitsClass.getDeclaredField("totalCapacity");
+            Field f;
+            try
+            {
+                f = bitsClass.getDeclaredField("totalCapacity");
+            }
+            catch (NoSuchFieldException ex)
+            {
+                // in Java11 it changed name to "TOTAL_CAPACITY"
+                f = bitsClass.getDeclaredField("TOTAL_CAPACITY");
+            }
             f.setAccessible(true);
             temp = f;
         }
@@ -153,10 +163,9 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
             }
             ObjectName me = new ObjectName(MBEAN_NAME);
             if (!mbs.isRegistered(me))
-                mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
+                MBeanWrapper.instance.registerMBean(this, new ObjectName(MBEAN_NAME));
         }
-        catch (RuntimeException | InstanceAlreadyExistsException | MBeanRegistrationException | 
-                NotCompliantMBeanException | MalformedObjectNameException | IOException e)
+        catch (MalformedObjectNameException | IOException e)
         {
             throw new RuntimeException(e);
         }

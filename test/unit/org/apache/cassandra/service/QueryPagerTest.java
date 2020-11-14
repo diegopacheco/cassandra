@@ -217,7 +217,7 @@ public class QueryPagerTest
         for (Row row : Util.once(partition.iterator()))
         {
             ByteBuffer expected = names[i++];
-            assertEquals("column " + i + " doesn't match "+string(expected)+" vs "+string(row.clustering().get(0)), expected, row.clustering().get(0));
+            assertEquals("column " + i + " doesn't match "+string(expected)+" vs "+string(row.clustering().bufferAt(0)), expected, row.clustering().bufferAt(0));
         }
     }
 
@@ -246,9 +246,10 @@ public class QueryPagerTest
     public void sliceQueryTest() throws Exception
     {
         sliceQueryTest(false, ProtocolVersion.V3);
-        sliceQueryTest(true, ProtocolVersion.V4);
-        sliceQueryTest(false, ProtocolVersion.V3);
-        sliceQueryTest(true, ProtocolVersion.V4);
+        sliceQueryTest(true,  ProtocolVersion.V3);
+
+        sliceQueryTest(false, ProtocolVersion.V4);
+        sliceQueryTest(true,  ProtocolVersion.V4);
     }
 
     public void sliceQueryTest(boolean testPagingState, ProtocolVersion protocolVersion) throws Exception
@@ -279,9 +280,10 @@ public class QueryPagerTest
     public void reversedSliceQueryTest() throws Exception
     {
         reversedSliceQueryTest(false, ProtocolVersion.V3);
-        reversedSliceQueryTest(true, ProtocolVersion.V4);
-        reversedSliceQueryTest(false, ProtocolVersion.V3);
-        reversedSliceQueryTest(true, ProtocolVersion.V4);
+        reversedSliceQueryTest(true,  ProtocolVersion.V3);
+
+        reversedSliceQueryTest(false, ProtocolVersion.V4);
+        reversedSliceQueryTest(true,  ProtocolVersion.V4);
     }
 
     public void reversedSliceQueryTest(boolean testPagingState, ProtocolVersion protocolVersion) throws Exception
@@ -312,9 +314,10 @@ public class QueryPagerTest
     public void multiQueryTest() throws Exception
     {
         multiQueryTest(false, ProtocolVersion.V3);
-        multiQueryTest(true, ProtocolVersion.V4);
-        multiQueryTest(false, ProtocolVersion.V3);
-        multiQueryTest(true, ProtocolVersion.V4);
+        multiQueryTest(true,  ProtocolVersion.V3);
+
+        multiQueryTest(false, ProtocolVersion.V4);
+        multiQueryTest(true,  ProtocolVersion.V4);
     }
 
     public void multiQueryTest(boolean testPagingState, ProtocolVersion protocolVersion) throws Exception
@@ -350,9 +353,10 @@ public class QueryPagerTest
     public void rangeNamesQueryTest() throws Exception
     {
         rangeNamesQueryTest(false, ProtocolVersion.V3);
-        rangeNamesQueryTest(true, ProtocolVersion.V4);
-        rangeNamesQueryTest(false, ProtocolVersion.V3);
-        rangeNamesQueryTest(true, ProtocolVersion.V4);
+        rangeNamesQueryTest(true,  ProtocolVersion.V3);
+
+        rangeNamesQueryTest(false, ProtocolVersion.V4);
+        rangeNamesQueryTest(true,  ProtocolVersion.V4);
     }
 
     public void rangeNamesQueryTest(boolean testPagingState, ProtocolVersion protocolVersion) throws Exception
@@ -379,9 +383,10 @@ public class QueryPagerTest
     public void rangeSliceQueryTest() throws Exception
     {
         rangeSliceQueryTest(false, ProtocolVersion.V3);
-        rangeSliceQueryTest(true, ProtocolVersion.V4);
-        rangeSliceQueryTest(false, ProtocolVersion.V3);
-        rangeSliceQueryTest(true, ProtocolVersion.V4);
+        rangeSliceQueryTest(true,  ProtocolVersion.V3);
+
+        rangeSliceQueryTest(false, ProtocolVersion.V4);
+        rangeSliceQueryTest(true,  ProtocolVersion.V4);
     }
 
     public void rangeSliceQueryTest(boolean testPagingState, ProtocolVersion protocolVersion) throws Exception
@@ -491,7 +496,7 @@ public class QueryPagerTest
                     Row row = partition.next();
                     int cellIndex = !reversed ? i : 4 - i;
 
-                    assertEquals(row.clustering().get(0), ByteBufferUtil.bytes(cellIndex));
+                    assertEquals(row.clustering().bufferAt(0), ByteBufferUtil.bytes(cellIndex));
                     assertCell(row, table.getColumn(new ColumnIdentifier("v1", false)), cellIndex);
                     assertCell(row, table.getColumn(new ColumnIdentifier("v2", false)), cellIndex);
 
@@ -511,8 +516,8 @@ public class QueryPagerTest
 
     private void assertCell(Row row, ColumnMetadata column, int value)
     {
-        Cell cell = row.getCell(column);
+        Cell<?> cell = row.getCell(column);
         assertNotNull(cell);
-        assertEquals(value, ByteBufferUtil.toInt(cell.value()));
+        assertEquals(value, ByteBufferUtil.toInt(cell.buffer()));
     }
 }

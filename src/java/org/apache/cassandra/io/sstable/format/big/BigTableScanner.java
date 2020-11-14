@@ -23,6 +23,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.AbstractIterator;
+
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterators;
 
 import org.apache.cassandra.db.*;
@@ -241,9 +243,9 @@ public class BigTableScanner implements ISSTableScanner
         return sstable.onDiskLength();
     }
 
-    public String getBackingFiles()
+    public Set<SSTableReader> getBackingSSTables()
     {
-        return sstable.toString();
+        return ImmutableSet.of(sstable);
     }
 
 
@@ -307,7 +309,7 @@ public class BigTableScanner implements ISSTableScanner
                             return endOfData();
 
                         currentKey = sstable.decorateKey(ByteBufferUtil.readWithShortLength(ifile));
-                        currentEntry = rowIndexEntrySerializer.deserialize(ifile, ifile.getFilePointer());
+                        currentEntry = rowIndexEntrySerializer.deserialize(ifile);
                     } while (!currentRange.contains(currentKey));
                 }
                 else
@@ -326,7 +328,7 @@ public class BigTableScanner implements ISSTableScanner
                 {
                     // we need the position of the start of the next key, regardless of whether it falls in the current range
                     nextKey = sstable.decorateKey(ByteBufferUtil.readWithShortLength(ifile));
-                    nextEntry = rowIndexEntrySerializer.deserialize(ifile, ifile.getFilePointer());
+                    nextEntry = rowIndexEntrySerializer.deserialize(ifile);
 
                     if (!currentRange.contains(nextKey))
                     {
@@ -420,9 +422,9 @@ public class BigTableScanner implements ISSTableScanner
             return 0;
         }
 
-        public String getBackingFiles()
+        public Set<SSTableReader> getBackingSSTables()
         {
-            return sstable.getFilename();
+            return ImmutableSet.of(sstable);
         }
 
         public TableMetadata metadata()

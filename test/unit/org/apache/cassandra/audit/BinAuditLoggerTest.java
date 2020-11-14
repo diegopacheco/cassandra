@@ -30,10 +30,11 @@ import net.openhft.chronicle.queue.ChronicleQueueBuilder;
 import net.openhft.chronicle.queue.ExcerptTailer;
 import net.openhft.chronicle.queue.RollCycles;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.utils.binlog.BinLogTest;
 
-import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.core.StringContains.containsString;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThat;
@@ -50,10 +51,11 @@ public class BinAuditLoggerTest extends CQLTester
 
         AuditLogOptions options = new AuditLogOptions();
         options.enabled = true;
-        options.logger = "BinAuditLogger";
+        options.logger = new ParameterizedClass("BinAuditLogger", null);
         options.roll_cycle = "TEST_SECONDLY";
         options.audit_logs_dir = tempDir.toString();
         DatabaseDescriptor.setAuditLoggingOptions(options);
+        AuditLogManager.instance.enable(DatabaseDescriptor.getAuditLoggingOptions());
         requireNetwork();
     }
 
@@ -76,12 +78,14 @@ public class BinAuditLoggerTest extends CQLTester
         {
             ExcerptTailer tailer = queue.createTailer();
             assertTrue(tailer.readDocument(wire -> {
-                assertEquals("AuditLog", wire.read("type").text());
+                assertEquals(0L, wire.read("version").int16());
+                assertEquals("audit", wire.read("type").text());
                 assertThat(wire.read("message").text(), containsString(AuditLogEntryType.PREPARE_STATEMENT.toString()));
             }));
 
             assertTrue(tailer.readDocument(wire -> {
-                assertEquals("AuditLog", wire.read("type").text());
+                assertEquals(0L, wire.read("version").int16());
+                assertEquals("audit", wire.read("type").text());
                 assertThat(wire.read("message").text(), containsString(AuditLogEntryType.SELECT.toString()));
             }));
             assertFalse(tailer.readDocument(wire -> {

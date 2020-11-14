@@ -17,22 +17,29 @@
  */
 package org.apache.cassandra.streaming;
 
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Throwables;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.streaming.messages.OutgoingStreamMessage;
+
+import static org.apache.cassandra.utils.ExecutorUtils.awaitTermination;
+import static org.apache.cassandra.utils.ExecutorUtils.shutdown;
 
 /**
  * StreamTransferTask sends streams for a given table
@@ -49,7 +56,8 @@ public class StreamTransferTask extends StreamTask
     protected final Map<Integer, OutgoingStreamMessage> streams = new HashMap<>();
     private final Map<Integer, ScheduledFuture> timeoutTasks = new HashMap<>();
 
-    private long totalSize;
+    private long totalSize = 0;
+    private int totalFiles = 0;
 
     public StreamTransferTask(StreamSession session, TableId tableId)
     {
@@ -62,7 +70,8 @@ public class StreamTransferTask extends StreamTask
         OutgoingStreamMessage message = new OutgoingStreamMessage(tableId, session, stream, sequenceNumber.getAndIncrement());
         message = StreamHook.instance.reportOutgoingStream(session, stream, message);
         streams.put(message.header.sequenceNumber, message);
-        totalSize += message.stream.getSize();
+        totalSize += message.stream.getEstimatedSize();
+        totalFiles += message.stream.getNumFiles();
     }
 
     /**
@@ -122,7 +131,7 @@ public class StreamTransferTask extends StreamTask
 
     public synchronized int getTotalNumberOfFiles()
     {
-        return streams.size();
+        return totalFiles;
     }
 
     public long getTotalSize()
@@ -177,5 +186,12 @@ public class StreamTransferTask extends StreamTask
         ScheduledFuture prev = timeoutTasks.put(sequenceNumber, future);
         assert prev == null;
         return future;
+    }
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit units) throws InterruptedException, TimeoutException
+    {
+        shutdown(timeoutExecutor);
+        awaitTermination(timeout, units, timeoutExecutor);
     }
 }

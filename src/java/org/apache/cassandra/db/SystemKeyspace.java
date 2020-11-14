@@ -100,7 +100,9 @@ public final class SystemKeyspace
     public static final String PEER_EVENTS_V2 = "peer_events_v2";
     public static final String COMPACTION_HISTORY = "compaction_history";
     public static final String SSTABLE_ACTIVITY = "sstable_activity";
-    public static final String SIZE_ESTIMATES = "size_estimates";
+    public static final String TABLE_ESTIMATES = "table_estimates";
+    public static final String TABLE_ESTIMATES_TYPE_PRIMARY = "primary";
+    public static final String TABLE_ESTIMATES_TYPE_LOCAL_PRIMARY = "local_primary";
     public static final String AVAILABLE_RANGES_V2 = "available_ranges_v2";
     public static final String TRANSFERRED_RANGES_V2 = "transferred_ranges_v2";
     public static final String VIEW_BUILDS_IN_PROGRESS = "view_builds_in_progress";
@@ -112,6 +114,7 @@ public final class SystemKeyspace
     @Deprecated public static final String LEGACY_PEER_EVENTS = "peer_events";
     @Deprecated public static final String LEGACY_TRANSFERRED_RANGES = "transferred_ranges";
     @Deprecated public static final String LEGACY_AVAILABLE_RANGES = "available_ranges";
+    @Deprecated public static final String LEGACY_SIZE_ESTIMATES = "size_estimates";
 
 
     public static final TableMetadata Batches =
@@ -237,9 +240,10 @@ public final class SystemKeyspace
                 + "PRIMARY KEY ((keyspace_name, columnfamily_name, generation)))")
                 .build();
 
-    private static final TableMetadata SizeEstimates =
-        parse(SIZE_ESTIMATES,
-                "per-table primary range size estimates",
+    @Deprecated
+    private static final TableMetadata LegacySizeEstimates =
+        parse(LEGACY_SIZE_ESTIMATES,
+              "per-table primary range size estimates, table is deprecated in favor of " + TABLE_ESTIMATES,
                 "CREATE TABLE %s ("
                 + "keyspace_name text,"
                 + "table_name text,"
@@ -249,6 +253,20 @@ public final class SystemKeyspace
                 + "partitions_count bigint,"
                 + "PRIMARY KEY ((keyspace_name), table_name, range_start, range_end))")
                 .build();
+
+    private static final TableMetadata TableEstimates =
+        parse(TABLE_ESTIMATES,
+              "per-table range size estimates",
+              "CREATE TABLE %s ("
+               + "keyspace_name text,"
+               + "table_name text,"
+               + "range_type text,"
+               + "range_start text,"
+               + "range_end text,"
+               + "mean_partition_size bigint,"
+               + "partitions_count bigint,"
+               + "PRIMARY KEY ((keyspace_name), table_name, range_type, range_start, range_end))")
+               .build();
 
     private static final TableMetadata AvailableRangesV2 =
     parse(AVAILABLE_RANGES_V2,
@@ -397,7 +415,8 @@ public final class SystemKeyspace
                          LegacyPeerEvents,
                          CompactionHistory,
                          SSTableActivity,
-                         SizeEstimates,
+                         LegacySizeEstimates,
+                         TableEstimates,
                          AvailableRangesV2,
                          LegacyAvailableRanges,
                          TransferredRangesV2,
@@ -688,16 +707,17 @@ public final class SystemKeyspace
         executeInternal(String.format(req, PEERS_V2), ep.address, ep.port, tokensAsSet(tokens));
     }
 
-    public static synchronized void updatePreferredIP(InetAddressAndPort ep, InetAddressAndPort preferred_ip)
+    public static synchronized boolean updatePreferredIP(InetAddressAndPort ep, InetAddressAndPort preferred_ip)
     {
-        if (getPreferredIP(ep) == preferred_ip)
-            return;
+        if (preferred_ip.equals(getPreferredIP(ep)))
+            return false;
 
         String req = "INSERT INTO system.%s (peer, preferred_ip) VALUES (?, ?)";
         executeInternal(String.format(req, LEGACY_PEERS), ep.address, preferred_ip.address);
         req = "INSERT INTO system.%s (peer, peer_port, preferred_ip, preferred_port) VALUES (?, ?, ?, ?)";
         executeInternal(String.format(req, PEERS_V2), ep.address, ep.port, preferred_ip.address, preferred_ip.port);
         forceBlockingFlush(LEGACY_PEERS, PEERS_V2);
+        return true;
     }
 
     public static synchronized void updatePeerInfo(InetAddressAndPort ep, String columnName, Object value)
@@ -777,7 +797,7 @@ public final class SystemKeyspace
 
     /**
      * This method is used to update the System Keyspace with the new tokens for this node
-    */
+     */
     public static synchronized void updateTokens(Collection<Token> tokens)
     {
         assert !tokens.isEmpty() : "removeEndpoint should be used instead";
@@ -1247,17 +1267,17 @@ public final class SystemKeyspace
     public static void updateSizeEstimates(String keyspace, String table, Map<Range<Token>, Pair<Long, Long>> estimates)
     {
         long timestamp = FBUtilities.timestampMicros();
-        PartitionUpdate.Builder update = new PartitionUpdate.Builder(SizeEstimates, UTF8Type.instance.decompose(keyspace), SizeEstimates.regularAndStaticColumns(), estimates.size());
-        // delete all previous values with a single range tombstone.
         int nowInSec = FBUtilities.nowInSeconds();
-        update.add(new RangeTombstone(Slice.make(SizeEstimates.comparator, table), new DeletionTime(timestamp - 1, nowInSec)));
+        PartitionUpdate.Builder update = new PartitionUpdate.Builder(LegacySizeEstimates, UTF8Type.instance.decompose(keyspace), LegacySizeEstimates.regularAndStaticColumns(), estimates.size());
+        // delete all previous values with a single range tombstone.
+        update.add(new RangeTombstone(Slice.make(LegacySizeEstimates.comparator, table), new DeletionTime(timestamp - 1, nowInSec)));
 
         // add a CQL row for each primary token range.
         for (Map.Entry<Range<Token>, Pair<Long, Long>> entry : estimates.entrySet())
         {
             Range<Token> range = entry.getKey();
             Pair<Long, Long> values = entry.getValue();
-            update.add(Rows.simpleBuilder(SizeEstimates, table, range.left.toString(), range.right.toString())
+            update.add(Rows.simpleBuilder(LegacySizeEstimates, table, range.left.toString(), range.right.toString())
                            .timestamp(timestamp)
                            .add("partitions_count", values.left)
                            .add("mean_partition_size", values.right)
@@ -1267,12 +1287,55 @@ public final class SystemKeyspace
     }
 
     /**
+     * Writes the current partition count and size estimates into table_estimates
+     */
+    public static void updateTableEstimates(String keyspace, String table, String type, Map<Range<Token>, Pair<Long, Long>> estimates)
+    {
+        long timestamp = FBUtilities.timestampMicros();
+        int nowInSec = FBUtilities.nowInSeconds();
+        PartitionUpdate.Builder update = new PartitionUpdate.Builder(TableEstimates, UTF8Type.instance.decompose(keyspace), TableEstimates.regularAndStaticColumns(), estimates.size());
+
+        // delete all previous values with a single range tombstone.
+        update.add(new RangeTombstone(Slice.make(TableEstimates.comparator, table, type), new DeletionTime(timestamp - 1, nowInSec)));
+
+        // add a CQL row for each primary token range.
+        for (Map.Entry<Range<Token>, Pair<Long, Long>> entry : estimates.entrySet())
+        {
+            Range<Token> range = entry.getKey();
+            Pair<Long, Long> values = entry.getValue();
+            update.add(Rows.simpleBuilder(TableEstimates, table, type, range.left.toString(), range.right.toString())
+                           .timestamp(timestamp)
+                           .add("partitions_count", values.left)
+                           .add("mean_partition_size", values.right)
+                           .build());
+        }
+
+        new Mutation(update.build()).apply();
+    }
+
+
+    /**
      * Clears size estimates for a table (on table drop)
      */
-    public static void clearSizeEstimates(String keyspace, String table)
+    public static void clearEstimates(String keyspace, String table)
     {
-        String cql = format("DELETE FROM %s WHERE keyspace_name = ? AND table_name = ?", SizeEstimates.toString());
+        String cqlFormat = "DELETE FROM %s WHERE keyspace_name = ? AND table_name = ?";
+        String cql = format(cqlFormat, LegacySizeEstimates.toString());
         executeInternal(cql, keyspace, table);
+        cql = String.format(cqlFormat, TableEstimates.toString());
+        executeInternal(cql, keyspace, table);
+    }
+
+    /**
+     * truncates size_estimates and table_estimates tables
+     */
+    public static void clearAllEstimates()
+    {
+        for (TableMetadata table : Arrays.asList(LegacySizeEstimates, TableEstimates))
+        {
+            String cql = String.format("TRUNCATE TABLE " + table.toString());
+            executeInternal(cql);
+        }
     }
 
     public static synchronized void updateAvailableRanges(String keyspace, Collection<Range<Token>> completedFullRanges, Collection<Range<Token>> completedTransientRanges)
@@ -1365,30 +1428,29 @@ public final class SystemKeyspace
 
     /**
      * Compare the release version in the system.local table with the one included in the distro.
-     * If they don't match, snapshot all tables in the system keyspace. This is intended to be
-     * called at startup to create a backup of the system tables during an upgrade
+     * If they don't match, snapshot all tables in the system and schema keyspaces. This is intended
+     * to be called at startup to create a backup of the system tables during an upgrade
      *
      * @throws IOException
      */
-    public static boolean snapshotOnVersionChange() throws IOException
+    public static void snapshotOnVersionChange() throws IOException
     {
         String previous = getPreviousVersionString();
         String next = FBUtilities.getReleaseVersionString();
 
-        // if we're restarting after an upgrade, snapshot the system keyspace
+        FBUtilities.setPreviousReleaseVersionString(previous);
+
+        // if we're restarting after an upgrade, snapshot the system and schema keyspaces
         if (!previous.equals(NULL_VERSION.toString()) && !previous.equals(next))
 
         {
-            logger.info("Detected version upgrade from {} to {}, snapshotting system keyspace", previous, next);
+            logger.info("Detected version upgrade from {} to {}, snapshotting system keyspaces", previous, next);
             String snapshotName = Keyspace.getTimestampedSnapshotName(format("upgrade-%s-%s",
                                                                              previous,
                                                                              next));
-            Keyspace systemKs = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME);
-            systemKs.snapshot(snapshotName, null);
-            return true;
+            for (String keyspace : SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES)
+                Keyspace.open(keyspace).snapshot(snapshotName, null, false, null);
         }
-
-        return false;
     }
 
     /**

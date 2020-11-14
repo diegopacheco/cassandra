@@ -54,7 +54,6 @@ public class JavaDriverClient
     private Cluster cluster;
     private Session session;
     private final LoadBalancingPolicy loadBalancingPolicy;
-    private final boolean allowServerPortDiscovery;
 
     private static final ConcurrentMap<String, PreparedStatement> stmts = new ConcurrentHashMap<>();
 
@@ -71,10 +70,9 @@ public class JavaDriverClient
         this.username = settings.mode.username;
         this.password = settings.mode.password;
         this.authProvider = settings.mode.authProvider;
-        this.encryptionOptions = encryptionOptions;
+        this.encryptionOptions = new EncryptionOptions(encryptionOptions).applyConfig();
         this.loadBalancingPolicy = loadBalancingPolicy(settings);
         this.connectionsPerHost = settings.mode.connectionsPerHost == null ? 8 : settings.mode.connectionsPerHost;
-        this.allowServerPortDiscovery = settings.node.allowServerPortDiscovery;
 
         int maxThreadCount = 0;
         if (settings.rate.auto)
@@ -136,19 +134,17 @@ public class JavaDriverClient
                                                 .withoutJMXReporting()
                                                 .withProtocolVersion(protocolVersion)
                                                 .withoutMetrics(); // The driver uses metrics 3 with conflict with our version
-        if (allowServerPortDiscovery)
-            clusterBuilder = clusterBuilder.allowServerPortDiscovery();
 
         if (loadBalancingPolicy != null)
             clusterBuilder.withLoadBalancingPolicy(loadBalancingPolicy);
         clusterBuilder.withCompression(compression);
-        if (encryptionOptions.enabled)
+        if (encryptionOptions.isEnabled())
         {
             SSLContext sslContext;
             sslContext = SSLFactory.createSSLContext(encryptionOptions, true);
             SSLOptions sslOptions = JdkSSLOptions.builder()
                                                  .withSSLContext(sslContext)
-                                                 .withCipherSuites(encryptionOptions.cipher_suites).build();
+                                                 .withCipherSuites(encryptionOptions.cipher_suites.toArray(new String[0])).build();
             clusterBuilder.withSSL(sslOptions);
         }
 

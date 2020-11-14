@@ -18,11 +18,13 @@
 package org.apache.cassandra.service;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import javax.annotation.Nullable;
@@ -33,6 +35,7 @@ import javax.management.openmbean.TabularData;
 
 import org.apache.cassandra.db.ColumnFamilyStoreMBean;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.locator.InetAddressAndPort;
 
 public interface StorageServiceMBean extends NotificationEmitter
 {
@@ -217,8 +220,6 @@ public interface StorageServiceMBean extends NotificationEmitter
     @Deprecated public List<InetAddress> getNaturalEndpoints(String keyspaceName, ByteBuffer key);
     public List<String> getNaturalEndpointsWithPort(String keysapceName, ByteBuffer key);
 
-    public List<String> getReplicas(String keyspaceName, String cf, String key);
-
     /**
      * @deprecated use {@link #takeSnapshot(String tag, Map options, String... entities)} instead.
      */
@@ -268,9 +269,30 @@ public interface StorageServiceMBean extends NotificationEmitter
     public long trueSnapshotsSize();
 
     /**
+     * Set the current hardlink-per-second throttle for snapshots
+     * A setting of zero indicates no throttling
+     *
+     * @param throttle
+     */
+    public void setSnapshotLinksPerSecond(long throttle);
+
+    /**
+     * Get the current hardlink-per-second throttle for snapshots
+     * A setting of zero indicates no throttling.
+     *
+     * @return snapshot links-per-second throttle
+     */
+    public long getSnapshotLinksPerSecond();
+
+    /**
      * Forces refresh of values stored in system.size_estimates of all column families.
      */
     public void refreshSizeEstimates() throws ExecutionException;
+
+    /**
+     * Removes extraneous entries in system.size_estimates.
+     */
+    public void cleanupSizeEstimates();
 
     /**
      * Forces major compaction of a single keyspace
@@ -353,6 +375,10 @@ public interface StorageServiceMBean extends NotificationEmitter
     public int repairAsync(String keyspace, Map<String, String> options);
 
     public void forceTerminateAllRepairSessions();
+
+    public void setRepairSessionMaxTreeDepth(int depth);
+
+    public int getRepairSessionMaxTreeDepth();
 
     /**
      * Get the status of a given parent repair session.
@@ -511,6 +537,13 @@ public interface StorageServiceMBean extends NotificationEmitter
     public void enableNativeTransportOldProtocolVersions();
     public void disableNativeTransportOldProtocolVersions();
 
+    // sets limits on number of concurrent requests in flights in number of bytes
+    public long getNativeTransportMaxConcurrentRequestsInBytes();
+    public void setNativeTransportMaxConcurrentRequestsInBytes(long newLimit);
+    public long getNativeTransportMaxConcurrentRequestsInBytesPerIp();
+    public void setNativeTransportMaxConcurrentRequestsInBytesPerIp(long newLimit);
+
+
     // allows a node that have been started without joining the ring to join it
     public void joinRing() throws IOException;
     public boolean isJoined();
@@ -565,8 +598,18 @@ public interface StorageServiceMBean extends NotificationEmitter
     public int getConcurrentCompactors();
     public void setConcurrentCompactors(int value);
 
+    public void bypassConcurrentValidatorsLimit();
+    public void enforceConcurrentValidatorsLimit();
+    public boolean isConcurrentValidatorsLimitEnforced();
+
     public int getConcurrentValidators();
     public void setConcurrentValidators(int value);
+
+    public int getSSTablePreemptiveOpenIntervalInMB();
+    public void setSSTablePreemptiveOpenIntervalInMB(int intervalInMB);
+
+    public boolean getMigrateKeycacheOnCompaction();
+    public void setMigrateKeycacheOnCompaction(boolean invalidateKeyCacheOnCompaction);
 
     public int getConcurrentViewBuilders();
     public void setConcurrentViewBuilders(int value);
@@ -671,6 +714,23 @@ public interface StorageServiceMBean extends NotificationEmitter
     /** Sets the threshold for abandoning queries with many tombstones */
     public void setTombstoneFailureThreshold(int tombstoneDebugThreshold);
 
+    /** Returns the number of rows cached at the coordinator before filtering/index queries log a warning. */
+    public int getCachedReplicaRowsWarnThreshold();
+
+    /** Sets the number of rows cached at the coordinator before filtering/index queries log a warning. */
+    public void setCachedReplicaRowsWarnThreshold(int threshold);
+
+    /** Returns the number of rows cached at the coordinator before filtering/index queries fail outright. */
+    public int getCachedReplicaRowsFailThreshold();
+
+    /** Sets the number of rows cached at the coordinator before filtering/index queries fail outright. */
+    public void setCachedReplicaRowsFailThreshold(int threshold);
+
+    /** Returns the threshold for skipping the column index when caching partition info **/
+    public int getColumnIndexCacheSize();
+    /** Sets the threshold for skipping the column index when caching partition info **/
+    public void setColumnIndexCacheSize(int cacheSizeInKB);
+
     /** Returns the threshold for rejecting queries due to a large batch size */
     public int getBatchSizeFailureThreshold();
     /** Sets the threshold for rejecting queries due to a large batch size */
@@ -692,12 +752,78 @@ public interface StorageServiceMBean extends NotificationEmitter
      */
     public boolean resumeBootstrap();
 
+    /** Gets the concurrency settings for processing stages*/
+    static class StageConcurrency implements Serializable
+    {
+        public final int corePoolSize;
+        public final int maximumPoolSize;
+
+        public StageConcurrency(int corePoolSize, int maximumPoolSize)
+        {
+            this.corePoolSize = corePoolSize;
+            this.maximumPoolSize = maximumPoolSize;
+        }
+
+    }
+    public Map<String, List<Integer>> getConcurrency(List<String> stageNames);
+
+    /** Sets the concurrency setting for processing stages */
+    public void setConcurrency(String threadPoolName, int newCorePoolSize, int newMaximumPoolSize);
 
     /** Clears the history of clients that have connected in the past **/
     void clearConnectionHistory();
     public void disableAuditLog();
+    public void enableAuditLog(String loggerName, Map<String, String> parameters, String includedKeyspaces, String excludedKeyspaces, String includedCategories, String excludedCategories, String includedUsers, String excludedUsers) throws ConfigurationException;
     public void enableAuditLog(String loggerName, String includedKeyspaces, String excludedKeyspaces, String includedCategories, String excludedCategories, String includedUsers, String excludedUsers) throws ConfigurationException;
     public boolean isAuditLogEnabled();
     public String getCorruptedTombstoneStrategy();
     public void setCorruptedTombstoneStrategy(String strategy);
+
+    /**
+     * Start the fully query logger.
+     * @param path Path where the full query log will be stored. If null cassandra.yaml value is used.
+     * @param rollCycle How often to create a new file for query data (MINUTELY, DAILY, HOURLY)
+     * @param blocking Whether threads submitting queries to the query log should block if they can't be drained to the filesystem or alternatively drops samples and log
+     * @param maxQueueWeight How many bytes of query data to queue before blocking or dropping samples
+     * @param maxLogSize How many bytes of log data to store before dropping segments. Might not be respected if a log file hasn't rolled so it can be deleted.
+     * @param archiveCommand executable archiving the rolled log files,
+     * @param maxArchiveRetries max number of times to retry a failing archive command
+     *
+     */
+    public void enableFullQueryLogger(String path, String rollCycle, Boolean blocking, int maxQueueWeight, long maxLogSize, @Nullable String archiveCommand, int maxArchiveRetries);
+
+    /**
+     * Disable the full query logger if it is enabled.
+     * Also delete any generated files in the last used full query log path as well as the one configure in cassandra.yaml
+     */
+    public void resetFullQueryLogger();
+
+    /**
+     * Stop logging queries but leave any generated files on disk.
+     */
+    public void stopFullQueryLogger();
+
+    public boolean isFullQueryLogEnabled();
+
+    /**
+     * Returns the current state of FQL.
+     */
+    CompositeData getFullQueryLoggerOptions();
+
+    /** Sets the initial allocation size of backing arrays for new RangeTombstoneList objects */
+    public void setInitialRangeTombstoneListAllocationSize(int size);
+
+    /** Returns the initial allocation size of backing arrays for new RangeTombstoneList objects */
+    public int getInitialRangeTombstoneListAllocationSize();
+
+    /** Sets the resize factor to use when growing/resizing a RangeTombstoneList */
+    public void setRangeTombstoneListResizeGrowthFactor(double growthFactor);
+
+    /** Returns the resize factor to use when growing/resizing a RangeTombstoneList */
+    public double getRangeTombstoneResizeListGrowthFactor();
+
+    /** Returns a map of schema version -> list of endpoints reporting that version that we need schema updates for */
+    @Deprecated
+    public Map<String, Set<InetAddress>> getOutstandingSchemaVersions();
+    public Map<String, Set<String>> getOutstandingSchemaVersionsWithPort();
 }

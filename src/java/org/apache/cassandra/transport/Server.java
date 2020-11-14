@@ -23,11 +23,16 @@ import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.codahale.metrics.Reservoir;
+import com.codahale.metrics.Snapshot;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
@@ -41,7 +46,8 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
-import io.netty.util.Version;
+import io.netty.handler.timeout.IdleStateEvent;
+import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -51,6 +57,8 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.metrics.DecayingEstimatedHistogramReservoir;
+import org.apache.cassandra.net.ResourceLimits;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaChangeListener;
 import org.apache.cassandra.security.SSLFactory;
@@ -79,16 +87,15 @@ public class Server implements CassandraDaemon.Server
     };
 
     public final InetSocketAddress socket;
-    public boolean useSSL = false;
+    public final EncryptionOptions.TlsEncryptionPolicy tlsEncryptionPolicy;
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
 
     private EventLoopGroup workerGroup;
-    private EventExecutor eventExecutorGroup;
 
     private Server (Builder builder)
     {
         this.socket = builder.getSocket();
-        this.useSSL = builder.useSSL;
+        this.tlsEncryptionPolicy = builder.tlsEncryptionPolicy;
         if (builder.workerGroup != null)
         {
             workerGroup = builder.workerGroup;
@@ -100,8 +107,6 @@ public class Server implements CassandraDaemon.Server
             else
                 workerGroup = new NioEventLoopGroup();
         }
-        if (builder.eventExecutorGroup != null)
-            eventExecutorGroup = builder.eventExecutorGroup;
         EventNotifier notifier = new EventNotifier(this);
         StorageService.instance.register(notifier);
         Schema.instance.registerListener(notifier);
@@ -135,29 +140,27 @@ public class Server implements CassandraDaemon.Server
         if (workerGroup != null)
             bootstrap = bootstrap.group(workerGroup);
 
-        if (this.useSSL)
-        {
-            final EncryptionOptions clientEnc = DatabaseDescriptor.getNativeProtocolEncryptionOptions();
+        final EncryptionOptions clientEnc = DatabaseDescriptor.getNativeProtocolEncryptionOptions();
 
-            if (clientEnc.optional)
-            {
-                logger.info("Enabling optionally encrypted CQL connections between client and server");
-                bootstrap.childHandler(new OptionalSecureInitializer(this, clientEnc));
-            }
-            else
-            {
-                logger.info("Enabling encrypted CQL connections between client and server");
-                bootstrap.childHandler(new SecureInitializer(this, clientEnc));
-            }
-        }
-        else
+        switch (this.tlsEncryptionPolicy)
         {
-            bootstrap.childHandler(new Initializer(this));
+            case UNENCRYPTED:
+                bootstrap.childHandler(new Initializer(this));
+                break;
+            case OPTIONAL:
+                logger.debug("Enabling optionally encrypted CQL connections between client and server");
+                bootstrap.childHandler(new OptionalSecureInitializer(this, clientEnc));
+                break;
+            case ENCRYPTED:
+                logger.debug("Enabling encrypted CQL connections between client and server");
+                bootstrap.childHandler(new SecureInitializer(this, clientEnc));
+                break;
+            default:
+                throw new IllegalStateException("Unrecognized TLS encryption policy: " + this.tlsEncryptionPolicy);
         }
 
         // Bind and start to accept incoming connections.
-        logger.info("Using Netty Version: {}", Version.identify().entrySet());
-        logger.info("Starting listening for CQL clients on {} ({})...", socket, this.useSSL ? "encrypted" : "unencrypted");
+        logger.info("Starting listening for CQL clients on {} ({})...", socket, clientEnc.tlsEncryptionPolicy().description());
 
         ChannelFuture bindFuture = bootstrap.bind(socket);
         if (!bindFuture.awaitUninterruptibly().isSuccess())
@@ -213,26 +216,20 @@ public class Server implements CassandraDaemon.Server
     {
         private EventLoopGroup workerGroup;
         private EventExecutor eventExecutorGroup;
-        private boolean useSSL = false;
+        private EncryptionOptions.TlsEncryptionPolicy tlsEncryptionPolicy = EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED;
         private InetAddress hostAddr;
         private int port = -1;
         private InetSocketAddress socket;
 
-        public Builder withSSL(boolean useSSL)
+        public Builder withTlsEncryptionPolicy(EncryptionOptions.TlsEncryptionPolicy tlsEncryptionPolicy)
         {
-            this.useSSL = useSSL;
+            this.tlsEncryptionPolicy = tlsEncryptionPolicy;
             return this;
         }
 
         public Builder withEventLoopGroup(EventLoopGroup eventLoopGroup)
         {
             this.workerGroup = eventLoopGroup;
-            return this;
-        }
-
-        public Builder withEventExecutor(EventExecutor eventExecutor)
-        {
-            this.eventExecutorGroup = eventExecutor;
             return this;
         }
 
@@ -337,6 +334,117 @@ public class Server implements CassandraDaemon.Server
 
     }
 
+    // global inflight payload across all channels across all endpoints
+    private static final ResourceLimits.Concurrent globalRequestPayloadInFlight = new ResourceLimits.Concurrent(DatabaseDescriptor.getNativeTransportMaxConcurrentRequestsInBytes());
+
+    public static class EndpointPayloadTracker
+    {
+        // inflight payload per endpoint across corresponding channels
+        private static final ConcurrentMap<InetAddress, EndpointPayloadTracker> requestPayloadInFlightPerEndpoint = new ConcurrentHashMap<>();
+
+        private final AtomicInteger refCount = new AtomicInteger(0);
+        private final InetAddress endpoint;
+
+        final ResourceLimits.EndpointAndGlobal endpointAndGlobalPayloadsInFlight = new ResourceLimits.EndpointAndGlobal(new ResourceLimits.Concurrent(DatabaseDescriptor.getNativeTransportMaxConcurrentRequestsInBytesPerIp()),
+                                                                                                                         globalRequestPayloadInFlight);
+
+        private EndpointPayloadTracker(InetAddress endpoint)
+        {
+            this.endpoint = endpoint;
+        }
+
+        public static EndpointPayloadTracker get(InetAddress endpoint)
+        {
+            while (true)
+            {
+                EndpointPayloadTracker result = requestPayloadInFlightPerEndpoint.computeIfAbsent(endpoint, EndpointPayloadTracker::new);
+                if (result.acquire())
+                    return result;
+
+                requestPayloadInFlightPerEndpoint.remove(endpoint, result);
+            }
+        }
+
+        public static long getCurrentGlobalUsage()
+        {
+            return globalRequestPayloadInFlight.using();
+        }
+
+        public static Snapshot getCurrentIpUsage()
+        {
+            DecayingEstimatedHistogramReservoir histogram = new DecayingEstimatedHistogramReservoir();
+            for (EndpointPayloadTracker tracker : requestPayloadInFlightPerEndpoint.values())
+            {
+                histogram.update(tracker.endpointAndGlobalPayloadsInFlight.endpoint().using());
+            }
+            return histogram.getSnapshot();
+        }
+
+        public static long getGlobalLimit()
+        {
+            return DatabaseDescriptor.getNativeTransportMaxConcurrentRequestsInBytes();
+        }
+
+        public static void setGlobalLimit(long newLimit)
+        {
+            DatabaseDescriptor.setNativeTransportMaxConcurrentRequestsInBytes(newLimit);
+            long existingLimit = globalRequestPayloadInFlight.setLimit(DatabaseDescriptor.getNativeTransportMaxConcurrentRequestsInBytes());
+
+            logger.info("Changed native_max_transport_requests_in_bytes from {} to {}", existingLimit, newLimit);
+        }
+
+        public static long getEndpointLimit()
+        {
+            return DatabaseDescriptor.getNativeTransportMaxConcurrentRequestsInBytesPerIp();
+        }
+
+        public static void setEndpointLimit(long newLimit)
+        {
+            long existingLimit = DatabaseDescriptor.getNativeTransportMaxConcurrentRequestsInBytesPerIp();
+            DatabaseDescriptor.setNativeTransportMaxConcurrentRequestsInBytesPerIp(newLimit); // ensure new trackers get the new limit
+            for (EndpointPayloadTracker tracker : requestPayloadInFlightPerEndpoint.values())
+                existingLimit = tracker.endpointAndGlobalPayloadsInFlight.endpoint().setLimit(newLimit);
+
+            logger.info("Changed native_max_transport_requests_in_bytes_per_ip from {} to {}", existingLimit, newLimit);
+        }
+
+        private boolean acquire()
+        {
+            return 0 < refCount.updateAndGet(i -> i < 0 ? i : i + 1);
+        }
+
+        public void release()
+        {
+            if (-1 == refCount.updateAndGet(i -> i == 1 ? -1 : i - 1))
+                requestPayloadInFlightPerEndpoint.remove(endpoint, this);
+        }
+
+        /**
+         * This will recompute the ip usage histo on each query of the snapshot when requested instead of trying to keep
+         * a histogram up to date with each request
+         */
+        public static Reservoir ipUsageReservoir()
+        {
+            return new Reservoir()
+            {
+                public int size()
+                {
+                    return requestPayloadInFlightPerEndpoint.size();
+                }
+
+                public void update(long l)
+                {
+                    throw new IllegalStateException();
+                }
+
+                public Snapshot getSnapshot()
+                {
+                    return getCurrentIpUsage();
+                }
+            };
+        }
+    }
+
     private static class Initializer extends ChannelInitializer<Channel>
     {
         // Stateless handlers
@@ -346,7 +454,6 @@ public class Server implements CassandraDaemon.Server
         private static final Frame.OutboundBodyTransformer outboundFrameTransformer = new Frame.OutboundBodyTransformer();
         private static final Frame.Encoder frameEncoder = new Frame.Encoder();
         private static final Message.ExceptionHandler exceptionHandler = new Message.ExceptionHandler();
-        private static final Message.Dispatcher dispatcher = new Message.Dispatcher(DatabaseDescriptor.useNativeTransportLegacyFlusher());
         private static final ConnectionLimitHandler connectionLimitHandler = new ConnectionLimitHandler();
 
         private final Server server;
@@ -368,6 +475,20 @@ public class Server implements CassandraDaemon.Server
                 pipeline.addFirst("connectionLimitHandler", connectionLimitHandler);
             }
 
+            long idleTimeout = DatabaseDescriptor.nativeTransportIdleTimeout();
+            if (idleTimeout > 0)
+            {
+                pipeline.addLast("idleStateHandler", new IdleStateHandler(false, 0, 0, idleTimeout, TimeUnit.MILLISECONDS)
+                {
+                    @Override
+                    protected void channelIdle(ChannelHandlerContext ctx, IdleStateEvent evt)
+                    {
+                        logger.info("Closing client connection {} after timeout of {}ms", channel.remoteAddress(), idleTimeout);
+                        ctx.close();
+                    }
+                });
+            }
+
             //pipeline.addLast("debug", new LoggingHandler());
 
             pipeline.addLast("frameDecoder", new Frame.Decoder(server.connectionFactory));
@@ -379,6 +500,9 @@ public class Server implements CassandraDaemon.Server
             pipeline.addLast("messageDecoder", messageDecoder);
             pipeline.addLast("messageEncoder", messageEncoder);
 
+            pipeline.addLast("executor", new Message.Dispatcher(DatabaseDescriptor.useNativeTransportLegacyFlusher(),
+                                                                EndpointPayloadTracker.get(((InetSocketAddress) channel.remoteAddress()).getAddress())));
+
             // The exceptionHandler will take care of handling exceptionCaught(...) events while still running
             // on the same EventLoop as all previous added handlers in the pipeline. This is important as the used
             // eventExecutorGroup may not enforce strict ordering for channel events.
@@ -386,11 +510,6 @@ public class Server implements CassandraDaemon.Server
             // correctly handled before the handler itself is removed.
             // See https://issues.apache.org/jira/browse/CASSANDRA-13649
             pipeline.addLast("exceptionHandler", exceptionHandler);
-
-            if (server.eventExecutorGroup != null)
-                pipeline.addLast(server.eventExecutorGroup, "executor", dispatcher);
-            else
-                pipeline.addLast("executor", dispatcher);
         }
     }
 
@@ -406,8 +525,7 @@ public class Server implements CassandraDaemon.Server
 
         protected final SslHandler createSslHandler(ByteBufAllocator allocator) throws IOException
         {
-            SslContext sslContext = SSLFactory.getSslContext(encryptionOptions, encryptionOptions.require_client_auth,
-                                                             SSLFactory.ConnectionType.NATIVE_TRANSPORT, SSLFactory.SocketType.SERVER);
+            SslContext sslContext = SSLFactory.getOrCreateSslContext(encryptionOptions, encryptionOptions.require_client_auth, SSLFactory.SocketType.SERVER);
             return sslContext.newHandler(allocator);
         }
     }
@@ -534,7 +652,7 @@ public class Server implements CassandraDaemon.Server
         private void send(InetAddressAndPort endpoint, Event.NodeEvent event)
         {
             if (logger.isTraceEnabled())
-                logger.trace("Sending event for endpoint {}, rpc address {}", endpoint, event.nodeAddress());
+                logger.trace("Sending event for endpoint {}, rpc address {}", endpoint, event.nodeAddressAndPort());
 
             // If the endpoint is not the local node, extract the node address
             // and if it is the same as our own RPC broadcast address (which defaults to the rcp address)
@@ -542,7 +660,7 @@ public class Server implements CassandraDaemon.Server
             // which is not useful to any driver and in fact may cauase serious problems to some drivers,
             // see CASSANDRA-10052
             if (!endpoint.equals(FBUtilities.getBroadcastAddressAndPort()) &&
-                event.nodeAddress().equals(FBUtilities.getJustBroadcastNativeAddress()))
+                event.nodeAddressAndPort().equals(FBUtilities.getBroadcastNativeAddressAndPort()))
                 return;
 
             send(event);

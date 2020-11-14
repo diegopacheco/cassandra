@@ -1,15 +1,42 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.cassandra.service.reads.repair;
 
-import java.util.Collections;
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
+import com.google.common.base.Predicates;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.google.common.primitives.Ints;
+
+import org.apache.cassandra.dht.ByteOrderedPartitioner;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.locator.EndpointsForToken;
 import org.apache.cassandra.locator.ReplicaPlan;
 import org.junit.Assert;
 import org.junit.Before;
@@ -42,19 +69,20 @@ import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.locator.EndpointsForRange;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
-import org.apache.cassandra.locator.ReplicaLayout;
+import org.apache.cassandra.locator.ReplicaPlans;
 import org.apache.cassandra.locator.ReplicaUtils;
-import org.apache.cassandra.net.MessageIn;
-import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.schema.MigrationManager;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.Tables;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.apache.cassandra.locator.Replica.fullReplica;
 import static org.apache.cassandra.locator.ReplicaUtils.FULL_RANGE;
+import static org.apache.cassandra.net.Verb.INTERNAL_RSP;
 
 @Ignore
 public abstract  class AbstractReadRepairTest
@@ -75,9 +103,9 @@ public abstract  class AbstractReadRepairTest
 
     static long now = TimeUnit.NANOSECONDS.toMicros(System.nanoTime());
     static DecoratedKey key;
-    static Cell cell1;
-    static Cell cell2;
-    static Cell cell3;
+    static Cell<?> cell1;
+    static Cell<?> cell2;
+    static Cell<?> cell3;
     static Mutation resolved;
 
     static ReadCommand command;
@@ -135,42 +163,40 @@ public abstract  class AbstractReadRepairTest
         return DatabaseDescriptor.getPartitioner().decorateKey(ByteBufferUtil.bytes(v));
     }
 
-    static Cell cell(String name, String value, long timestamp)
+    static Cell<?> cell(String name, String value, long timestamp)
     {
         return BufferCell.live(cfm.getColumn(ColumnIdentifier.getInterned(name, false)), timestamp, ByteBufferUtil.bytes(value));
     }
 
-    static PartitionUpdate update(Cell... cells)
+    static PartitionUpdate update(Cell<?>... cells)
     {
         Row.Builder builder = BTreeRow.unsortedBuilder();
         builder.newRow(Clustering.EMPTY);
-        for (Cell cell: cells)
+        for (Cell<?> cell: cells)
         {
             builder.addCell(cell);
         }
         return PartitionUpdate.singleRowUpdate(cfm, key, builder.build());
     }
 
-    static PartitionIterator partition(Cell... cells)
+    static PartitionIterator partition(Cell<?>... cells)
     {
         UnfilteredPartitionIterator iter = new SingletonUnfilteredPartitionIterator(update(cells).unfilteredIterator());
         return UnfilteredPartitionIterators.filter(iter, Ints.checkedCast(TimeUnit.MICROSECONDS.toSeconds(now)));
     }
 
-    static Mutation mutation(Cell... cells)
+    static Mutation mutation(Cell<?>... cells)
     {
         return new Mutation(update(cells));
     }
 
     @SuppressWarnings("resource")
-    static MessageIn<ReadResponse> msg(InetAddressAndPort from, Cell... cells)
+    static Message<ReadResponse> msg(InetAddressAndPort from, Cell<?>... cells)
     {
         UnfilteredPartitionIterator iter = new SingletonUnfilteredPartitionIterator(update(cells).unfilteredIterator());
-        return MessageIn.create(from,
-                                ReadResponse.createDataResponse(iter, command),
-                                Collections.emptyMap(),
-                                MessagingService.Verb.INTERNAL_RESPONSE,
-                                MessagingService.current_version);
+        return Message.builder(INTERNAL_RSP, ReadResponse.createDataResponse(iter, command))
+                      .from(from)
+                      .build();
     }
 
     static class ResultConsumer implements Consumer<PartitionIterator>
@@ -220,6 +246,14 @@ public abstract  class AbstractReadRepairTest
 
         replicaPlan = replicaPlan(ConsistencyLevel.QUORUM, replicas);
 
+        StorageService.instance.getTokenMetadata().clearUnsafe();
+        StorageService.instance.getTokenMetadata().updateNormalToken(ByteOrderedPartitioner.instance.getToken(ByteBuffer.wrap(new byte[] { 0 })), replica1.endpoint());
+        StorageService.instance.getTokenMetadata().updateNormalToken(ByteOrderedPartitioner.instance.getToken(ByteBuffer.wrap(new byte[] { 1 })), replica2.endpoint());
+        StorageService.instance.getTokenMetadata().updateNormalToken(ByteOrderedPartitioner.instance.getToken(ByteBuffer.wrap(new byte[] { 2 })), replica3.endpoint());
+        Gossiper.instance.initializeNodeUnsafe(replica1.endpoint(), UUID.randomUUID(), 1);
+        Gossiper.instance.initializeNodeUnsafe(replica2.endpoint(), UUID.randomUUID(), 1);
+        Gossiper.instance.initializeNodeUnsafe(replica3.endpoint(), UUID.randomUUID(), 1);
+
         // default test values
         key  = dk(5);
         cell1 = cell("v", "val1", now);
@@ -251,6 +285,22 @@ public abstract  class AbstractReadRepairTest
         return replicaPlan(ks, consistencyLevel, replicas, replicas);
     }
 
+    static ReplicaPlan.ForTokenWrite repairPlan(ReplicaPlan.ForRangeRead readPlan)
+    {
+        return repairPlan(readPlan, readPlan.candidates());
+    }
+
+    static ReplicaPlan.ForTokenWrite repairPlan(EndpointsForRange liveAndDown, EndpointsForRange targets)
+    {
+        return repairPlan(replicaPlan(liveAndDown, targets), liveAndDown);
+    }
+
+    static ReplicaPlan.ForTokenWrite repairPlan(ReplicaPlan.ForRangeRead readPlan, EndpointsForRange liveAndDown)
+    {
+        Token token = readPlan.range().left.getToken();
+        EndpointsForToken pending = EndpointsForToken.empty(token);
+        return ReplicaPlans.forWrite(ks, ConsistencyLevel.TWO, liveAndDown.forToken(token), pending, Predicates.alwaysTrue(), ReplicaPlans.writeReadRepair(readPlan));
+    }
     static ReplicaPlan.ForRangeRead replicaPlan(EndpointsForRange replicas, EndpointsForRange targets)
     {
         return replicaPlan(ks, ConsistencyLevel.QUORUM, replicas, targets);
@@ -261,8 +311,7 @@ public abstract  class AbstractReadRepairTest
     }
     static ReplicaPlan.ForRangeRead replicaPlan(Keyspace keyspace, ConsistencyLevel consistencyLevel, EndpointsForRange replicas, EndpointsForRange targets)
     {
-        return new ReplicaPlan.ForRangeRead(keyspace, consistencyLevel,
-                ReplicaUtils.FULL_BOUNDS, replicas, targets);
+        return new ReplicaPlan.ForRangeRead(keyspace, consistencyLevel, ReplicaUtils.FULL_BOUNDS, replicas, targets, 1);
     }
 
     public abstract InstrumentedReadRepair createInstrumentedReadRepair(ReadCommand command, ReplicaPlan.Shared<?, ?> replicaPlan, long queryStartNanoTime);
@@ -306,8 +355,8 @@ public abstract  class AbstractReadRepairTest
         repair.startRepair(null, consumer);
 
         Assert.assertEquals(epSet(target1, target2), repair.getReadRecipients());
-        repair.getReadCallback().response(msg(target1, cell1));
-        repair.getReadCallback().response(msg(target2, cell1));
+        repair.getReadCallback().onResponse(msg(target1, cell1));
+        repair.getReadCallback().onResponse(msg(target2, cell1));
 
         repair.maybeSendAdditionalReads();
         Assert.assertEquals(epSet(target1, target2), repair.getReadRecipients());

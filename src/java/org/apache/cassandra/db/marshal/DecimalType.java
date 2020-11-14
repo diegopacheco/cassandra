@@ -20,7 +20,9 @@ package org.apache.cassandra.db.marshal;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.MathContext;
+import java.math.RoundingMode;
 import java.nio.ByteBuffer;
+import java.util.Objects;
 
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Constants;
@@ -34,6 +36,10 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 public class DecimalType extends NumberType<BigDecimal>
 {
     public static final DecimalType instance = new DecimalType();
+    private static final int MIN_SCALE = 32;
+    private static final int MIN_SIGNIFICANT_DIGITS = MIN_SCALE;
+    private static final int MAX_SCALE = 1000;
+    private static final MathContext MAX_PRECISION = new MathContext(10000);
 
     DecimalType() {super(ComparisonType.CUSTOM);} // singleton
 
@@ -48,12 +54,9 @@ public class DecimalType extends NumberType<BigDecimal>
         return true;
     }
 
-    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
     {
-        if (!o1.hasRemaining() || !o2.hasRemaining())
-            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
-
-        return compose(o1).compareTo(compose(o2));
+        return compareComposed(left, accessorL, right, accessorR, this);
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -80,9 +83,9 @@ public class DecimalType extends NumberType<BigDecimal>
     {
         try
         {
-            return new Constants.Value(getSerializer().serialize(new BigDecimal(parsed.toString())));
+            return new Constants.Value(fromString(Objects.toString(parsed)));
         }
-        catch (NumberFormatException exc)
+        catch (NumberFormatException | MarshalException exc)
         {
             throw new MarshalException(String.format("Value '%s' is not a valid representation of a decimal value", parsed));
         }
@@ -91,7 +94,7 @@ public class DecimalType extends NumberType<BigDecimal>
     @Override
     public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
-        return getSerializer().deserialize(buffer).toString();
+        return Objects.toString(getSerializer().deserialize(buffer), "\"\"");
     }
 
     public CQL3Type asCQL3Type()
@@ -142,27 +145,41 @@ public class DecimalType extends NumberType<BigDecimal>
 
     public ByteBuffer add(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
     {
-        return decompose(leftType.toBigDecimal(left).add(rightType.toBigDecimal(right), MathContext.DECIMAL128));
+        return decompose(leftType.toBigDecimal(left).add(rightType.toBigDecimal(right), MAX_PRECISION));
     }
 
     public ByteBuffer substract(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
     {
-        return decompose(leftType.toBigDecimal(left).subtract(rightType.toBigDecimal(right), MathContext.DECIMAL128));
+        return decompose(leftType.toBigDecimal(left).subtract(rightType.toBigDecimal(right), MAX_PRECISION));
     }
 
     public ByteBuffer multiply(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
     {
-        return decompose(leftType.toBigDecimal(left).multiply(rightType.toBigDecimal(right), MathContext.DECIMAL128));
+        return decompose(leftType.toBigDecimal(left).multiply(rightType.toBigDecimal(right), MAX_PRECISION));
     }
 
     public ByteBuffer divide(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
     {
-        return decompose(leftType.toBigDecimal(left).divide(rightType.toBigDecimal(right), MathContext.DECIMAL128));
+        BigDecimal leftOperand = leftType.toBigDecimal(left);
+        BigDecimal rightOperand = rightType.toBigDecimal(right);
+
+        // Predict position of first significant digit in the quotient.
+        // Note: it is possible to improve prediction accuracy by comparing first significant digits in operands
+        // but it requires additional computations so this step is omitted
+        int quotientFirstDigitPos = (leftOperand.precision() - leftOperand.scale()) - (rightOperand.precision() - rightOperand.scale());
+
+        int scale = MIN_SIGNIFICANT_DIGITS - quotientFirstDigitPos;
+        scale = Math.max(scale, leftOperand.scale());
+        scale = Math.max(scale, rightOperand.scale());
+        scale = Math.max(scale, MIN_SCALE);
+        scale = Math.min(scale, MAX_SCALE);
+
+        return decompose(leftOperand.divide(rightOperand, scale, RoundingMode.HALF_UP).stripTrailingZeros());
     }
 
     public ByteBuffer mod(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
     {
-        return decompose(leftType.toBigDecimal(left).remainder(rightType.toBigDecimal(right), MathContext.DECIMAL128));
+        return decompose(leftType.toBigDecimal(left).remainder(rightType.toBigDecimal(right)));
     }
 
     public ByteBuffer negate(ByteBuffer input)

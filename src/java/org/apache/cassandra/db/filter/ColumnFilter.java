@@ -30,6 +30,7 @@ import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.CellPath;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessagingService;
@@ -233,7 +234,12 @@ public class ColumnFilter
     public boolean fetchedCellIsQueried(ColumnMetadata column, CellPath path)
     {
         assert path != null;
-        if (!fetchAllRegulars || subSelections == null)
+
+        // first verify that the column to which the cell belongs is queried
+        if (!fetchedColumnIsQueried(column))
+            return false;
+
+        if (subSelections == null)
             return true;
 
         SortedSet<ColumnSubselection> s = subSelections.get(column.name);
@@ -276,7 +282,7 @@ public class ColumnFilter
      * @param cells the cells to filter.
      * @return a filtered iterator that only include the cells from {@code cells} that are included by this filter.
      */
-    public Iterator<Cell> filterComplexCells(ColumnMetadata column, Iterator<Cell> cells)
+    public Iterator<Cell<?>> filterComplexCells(ColumnMetadata column, Iterator<Cell<?>> cells)
     {
         Tester tester = newTester(column);
         if (tester == null)
@@ -449,6 +455,10 @@ public class ColumnFilter
                 }
             }
 
+            // see CASSANDRA-15833
+            if (isFetchAll && Gossiper.instance.haveMajorVersion3Nodes())
+                queried = null;
+
             return new ColumnFilter(isFetchAll, metadata, queried, s);
         }
     }
@@ -587,8 +597,8 @@ public class ColumnFilter
             {
                 if (version >= MessagingService.VERSION_3014)
                 {
-                    Columns statics = Columns.serializer.deserialize(in, metadata);
-                    Columns regulars = Columns.serializer.deserialize(in, metadata);
+                    Columns statics = Columns.serializer.deserializeStatics(in, metadata);
+                    Columns regulars = Columns.serializer.deserializeRegulars(in, metadata);
                     fetched = new RegularAndStaticColumns(statics, regulars);
                 }
                 else
@@ -599,8 +609,8 @@ public class ColumnFilter
 
             if (hasQueried)
             {
-                Columns statics = Columns.serializer.deserialize(in, metadata);
-                Columns regulars = Columns.serializer.deserialize(in, metadata);
+                Columns statics = Columns.serializer.deserializeStatics(in, metadata);
+                Columns regulars = Columns.serializer.deserializeRegulars(in, metadata);
                 queried = new RegularAndStaticColumns(statics, regulars);
             }
 
@@ -615,6 +625,10 @@ public class ColumnFilter
                     subSelections.put(subSel.column().name, subSel);
                 }
             }
+
+            // See CASSANDRA-15833
+            if (version <= MessagingService.VERSION_3014 && isFetchAll)
+                queried = null;
 
             // Same concern than in serialize/serializedSize: we should be wary of the change in meaning for isFetchAll.
             // If we get a filter with isFetchAll from 3.0/3.x, it actually expects all static columns to be fetched,

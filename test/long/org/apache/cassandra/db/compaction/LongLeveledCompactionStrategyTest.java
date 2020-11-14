@@ -97,7 +97,7 @@ public class LongLeveledCompactionStrategyTest
                 {
                     public void run()
                     {
-                        nextTask.execute(null);
+                        nextTask.execute(ActiveCompactionsTracker.NOOP);
                     }
                 });
             }
@@ -117,7 +117,7 @@ public class LongLeveledCompactionStrategyTest
         int levels = manifest.getLevelCount();
         for (int level = 0; level < levels; level++)
         {
-            List<SSTableReader> sstables = manifest.getLevel(level);
+            Set<SSTableReader> sstables = manifest.getLevel(level);
             // score check
             assert (double) SSTableReader.getTotalBytes(sstables) / manifest.maxBytesForLevel(level, 1 * 1024 * 1024) < 1.00;
             // overlap check for levels greater than 0

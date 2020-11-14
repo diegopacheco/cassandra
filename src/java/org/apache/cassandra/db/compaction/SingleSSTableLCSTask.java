@@ -57,7 +57,7 @@ public class SingleSSTableLCSTask extends AbstractCompactionTask
     }
 
     @Override
-    protected int executeInternal(CompactionManager.CompactionExecutorStatsCollector collector)
+    protected int executeInternal(ActiveCompactionsTracker activeCompactions)
     {
         run();
         return 1;
@@ -77,8 +77,7 @@ public class SingleSSTableLCSTask extends AbstractCompactionTask
             try
             {
                 logger.info("Changing level on {} from {} to {}", sstable, metadataBefore.sstableLevel, level);
-                sstable.descriptor.getMetadataSerializer().mutateLevel(sstable.descriptor, level);
-                sstable.reloadSSTableMetadata();
+                sstable.mutateLevelAndReload(level);
             }
             catch (Throwable t)
             {

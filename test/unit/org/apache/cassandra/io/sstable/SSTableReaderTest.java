@@ -22,14 +22,14 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.attribute.FileAttribute;
 import java.util.*;
 import java.util.concurrent.*;
 
 import com.google.common.collect.Sets;
-import org.junit.Assert;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.ExpectedException;
 import org.junit.runner.RunWith;
 
 import org.apache.cassandra.OrderedJUnit4ClassRunner;
@@ -40,6 +40,8 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.dht.IPartitioner;
@@ -47,16 +49,18 @@ import org.apache.cassandra.dht.LocalPartitioner.LocalToken;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.MmappedRegions;
 import org.apache.cassandra.schema.CachingParams;
+import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FilterFactory;
-import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
 
+import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -68,6 +72,7 @@ public class SSTableReaderTest
     public static final String KEYSPACE1 = "SSTableReaderTest";
     public static final String CF_STANDARD = "Standard1";
     public static final String CF_STANDARD2 = "Standard2";
+    public static final String CF_COMPRESSED = "Compressed";
     public static final String CF_INDEXED = "Indexed1";
     public static final String CF_STANDARDLOWINDEXINTERVAL = "StandardLowIndexInterval";
 
@@ -86,6 +91,7 @@ public class SSTableReaderTest
                                     KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD2),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_COMPRESSED).compression(CompressionParams.DEFAULT),
                                     SchemaLoader.compositeIndexCFMD(KEYSPACE1, CF_INDEXED, true),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARDLOWINDEXINTERVAL)
                                                 .minIndexInterval(8)
@@ -472,7 +478,7 @@ public class SSTableReaderTest
             SSTableReader sstable = indexCfs.getLiveSSTables().iterator().next();
             assert sstable.first.getToken() instanceof LocalToken;
 
-            sstable.saveSummary();
+            SSTableReader.saveSummary(sstable.descriptor, sstable.first, sstable.last, sstable.indexSummary);
             SSTableReader reopened = SSTableReader.open(sstable.descriptor);
             assert reopened.first.getToken() instanceof LocalToken;
             reopened.selfRef().release();
@@ -585,7 +591,7 @@ public class SSTableReaderTest
                 public void run()
                 {
                     Row row = Util.getOnlyRowUnfiltered(Util.cmd(store, key).build());
-                    assertEquals(0, ByteBufferUtil.compare(String.format("%3d", index).getBytes(), row.cells().iterator().next().value()));
+                    assertEquals(0, ByteBufferUtil.compare(String.format("%3d", index).getBytes(), row.cells().iterator().next().buffer()));
                 }
             }));
 
@@ -760,5 +766,83 @@ public class SSTableReaderTest
         }
         cfs.forceBlockingFlush();
         return Sets.difference(cfs.getLiveSSTables(), before).iterator().next();
+    }
+
+    @Test
+    public void testGetApproximateKeyCount() throws InterruptedException
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore("Standard1");
+        cfs.discardSSTables(System.currentTimeMillis()); //Cleaning all existing SSTables.
+        getNewSSTable(cfs);
+
+        try (ColumnFamilyStore.RefViewFragment viewFragment1 = cfs.selectAndReference(View.selectFunction(SSTableSet.CANONICAL)))
+        {
+            cfs.discardSSTables(System.currentTimeMillis());
+
+            TimeUnit.MILLISECONDS.sleep(1000); //Giving enough time to clear files.
+            List<SSTableReader> sstables = new ArrayList<>(viewFragment1.sstables);
+            assertEquals(50, SSTableReader.getApproximateKeyCount(sstables));
+        }
+    }
+
+    @Rule
+    public ExpectedException expectedException = ExpectedException.none();
+
+    @Test
+    public void testVerifyCompressionInfoExistenceThrows()
+    {
+        Descriptor desc = setUpForTestVerfiyCompressionInfoExistence();
+
+        // delete the compression info, so it is corrupted.
+        File compressionInfoFile = new File(desc.filenameFor(Component.COMPRESSION_INFO));
+        compressionInfoFile.delete();
+        assertFalse("CompressionInfo file should not exist", compressionInfoFile.exists());
+
+        // discovert the components on disk after deletion
+        Set<Component> components = SSTable.discoverComponentsFor(desc);
+
+        expectedException.expect(CorruptSSTableException.class);
+        expectedException.expectMessage("CompressionInfo.db");
+        SSTableReader.verifyCompressionInfoExistenceIfApplicable(desc, components);
+    }
+
+    @Test
+    public void testVerifyCompressionInfoExistenceWhenTOCUnableToOpen()
+    {
+        Descriptor desc = setUpForTestVerfiyCompressionInfoExistence();
+        Set<Component> components = SSTable.discoverComponentsFor(desc);
+        SSTableReader.verifyCompressionInfoExistenceIfApplicable(desc, components);
+
+        // mark the toc file not readable in order to trigger the FSReadError
+        File tocFile = new File(desc.filenameFor(Component.TOC));
+        tocFile.setReadable(false);
+
+        expectedException.expect(FSReadError.class);
+        expectedException.expectMessage("TOC.txt");
+        SSTableReader.verifyCompressionInfoExistenceIfApplicable(desc, components);
+    }
+
+    @Test
+    public void testVerifyCompressionInfoExistencePasses()
+    {
+        Descriptor desc = setUpForTestVerfiyCompressionInfoExistence();
+        Set<Component> components = SSTable.discoverComponentsFor(desc);
+        SSTableReader.verifyCompressionInfoExistenceIfApplicable(desc, components);
+    }
+
+    private Descriptor setUpForTestVerfiyCompressionInfoExistence()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_COMPRESSED);
+        SSTableReader sstable = getNewSSTable(cfs);
+        cfs.clearUnsafe();
+        Descriptor desc = sstable.descriptor;
+
+        File compressionInfoFile = new File(desc.filenameFor(Component.COMPRESSION_INFO));
+        File tocFile = new File(desc.filenameFor(Component.TOC));
+        assertTrue("CompressionInfo file should exist", compressionInfoFile.exists());
+        assertTrue("TOC file should exist", tocFile.exists());
+        return desc;
     }
 }

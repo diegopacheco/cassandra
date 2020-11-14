@@ -60,8 +60,12 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+
 public class SASIIndex implements Index, INotificationConsumer
 {
+    public final static String USAGE_WARNING = "SASI indexes are experimental and are not recommended for production use.";
+
     private static class SASIIndexBuildingSupport implements IndexBuildingSupport
     {
         public SecondaryIndexBuilder getIndexBuildTask(ColumnFamilyStore cfs,
@@ -293,7 +297,7 @@ public class SASIIndex implements Index, INotificationConsumer
     {
         TableMetadata config = command.metadata();
         ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(config.id);
-        return controller -> new QueryPlan(cfs, command, DatabaseDescriptor.getRangeRpcTimeout()).execute(controller);
+        return controller -> new QueryPlan(cfs, command, DatabaseDescriptor.getRangeRpcTimeout(MILLISECONDS)).execute(controller);
     }
 
     public SSTableFlushObserver getFlushObserver(Descriptor descriptor, OperationType opType)

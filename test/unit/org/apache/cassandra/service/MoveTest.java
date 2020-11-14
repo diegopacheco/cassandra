@@ -21,10 +21,18 @@ package org.apache.cassandra.service;
 
 import java.net.UnknownHostException;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.function.Consumer;
 
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multimap;
+
+import org.apache.cassandra.config.OverrideConfigurationLoader;
+import org.apache.cassandra.diag.DiagnosticEventService;
+import org.apache.cassandra.gms.GossiperEvent;
 import org.apache.cassandra.locator.EndpointsForRange;
 import org.apache.cassandra.locator.EndpointsForToken;
 import org.apache.cassandra.locator.RangesAtEndpoint;
@@ -32,7 +40,11 @@ import org.apache.cassandra.locator.RangesByEndpoint;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestRule;
+import org.junit.rules.TestWatcher;
+import org.junit.runner.Description;
 
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
@@ -99,6 +111,7 @@ public class MoveTest
         addNetworkTopologyKeyspace(Network_11_KeyspaceName, 1, 1);
         addNetworkTopologyKeyspace(Network_22_KeyspaceName, 2, 2);
         addNetworkTopologyKeyspace(Network_33_KeyspaceName, 3, 3);
+        DatabaseDescriptor.setDiagnosticEventsEnabled(true);
     }
 
     @AfterClass
@@ -108,10 +121,31 @@ public class MoveTest
     }
 
     @Before
-    public void clearTokenMetadata()
+    public void clearTokenMetadata() throws InterruptedException
     {
+        // we expect to have a single endpoint before running each test method,
+        // so we have to wait for the GossipStage thread to evict stale endpoints
+        // from membership before moving on, otherwise it may break other tests as
+        // things change in the background
+        final int endpointCount = Gossiper.instance.getEndpointCount() - 1;
+        final CountDownLatch latch = new CountDownLatch(endpointCount);
+        Consumer onEndpointEvicted = event -> latch.countDown();
+        DiagnosticEventService.instance().subscribe(GossiperEvent.class,
+                                                    GossiperEvent.GossiperEventType.EVICTED_FROM_MEMBERSHIP,
+                                                    onEndpointEvicted);
+
         PendingRangeCalculatorService.instance.blockUntilFinished();
         StorageService.instance.getTokenMetadata().clearUnsafe();
+
+        try
+        {
+            if (!latch.await(1, TimeUnit.MINUTES))
+                throw new RuntimeException("Took too long to evict stale endpoints.");
+        }
+        finally
+        {
+            DiagnosticEventService.instance().unsubscribe(onEndpointEvicted);
+        }
     }
 
     private static void addNetworkTopologyKeyspace(String keyspaceName, Integer... replicas) throws Exception
@@ -496,7 +530,16 @@ public class MoveTest
     {
         tmd.removeFromMoving(host);
         assertTrue(!tmd.isMoving(host));
-        tmd.updateNormalToken(new BigIntegerToken(String.valueOf(token)), host);
+        Token newToken = new BigIntegerToken(String.valueOf(token));
+        tmd.updateNormalToken(newToken, host);
+        // As well as upating TMD, update the host's tokens in gossip. Since CASSANDRA-15120, status changing to MOVING
+        // ensures that TMD is up to date with token assignments according to gossip. So we need to make sure gossip has
+        // the correct new token, as the moving node itself would do upon successful completion of the move operation.
+        // Without this, the next movement for that host will set the token in TMD's back to the old value from gossip
+        // and incorrect range movements will follow
+        Gossiper.instance.injectApplicationState(host,
+                                                 ApplicationState.TOKENS,
+                                                 new VersionedValue.VersionedValueFactory(partitioner).tokens(Collections.singleton(newToken)));
     }
 
     private Map.Entry<Range<Token>, EndpointsForRange> generatePendingMapEntry(int start, int end, String... endpoints) throws UnknownHostException

@@ -32,6 +32,7 @@ import org.junit.*;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
 import org.apache.cassandra.dht.Token;
@@ -41,10 +42,12 @@ import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.VersionedValue.VersionedValueFactory;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.TokenMetadata;
-import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.apache.cassandra.net.NoPayload.noPayload;
+import static org.apache.cassandra.net.Verb.REPLICATION_DONE_REQ;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -53,6 +56,7 @@ public class RemoveTest
     static
     {
         DatabaseDescriptor.daemonInitialization();
+        CommitLog.instance.start();
     }
 
     static final IPartitioner partitioner = RandomPartitioner.instance;
@@ -96,8 +100,9 @@ public class RemoveTest
     @After
     public void tearDown()
     {
-        MessagingService.instance().clearMessageSinks();
-        MessagingService.instance().clearCallbacksUnsafe();
+        MessagingService.instance().inboundSink.clear();
+        MessagingService.instance().outboundSink.clear();
+        MessagingService.instance().callbacks.unsafeClear();
     }
 
     @Test(expected = UnsupportedOperationException.class)
@@ -161,8 +166,10 @@ public class RemoveTest
 
         for (InetAddressAndPort host : hosts)
         {
-            MessageOut msg = new MessageOut(host, MessagingService.Verb.REPLICATION_FINISHED, null, null, Collections.<Object>emptyList(), null);
-            MessagingService.instance().sendRR(msg, FBUtilities.getBroadcastAddressAndPort());
+            Message msg = Message.builder(REPLICATION_DONE_REQ, noPayload)
+                                 .from(host)
+                                 .build();
+            MessagingService.instance().send(msg, FBUtilities.getBroadcastAddressAndPort());
         }
 
         remover.join();

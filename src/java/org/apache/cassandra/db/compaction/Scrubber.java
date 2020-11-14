@@ -23,6 +23,7 @@ import java.util.*;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableSet;
 
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
@@ -475,12 +476,18 @@ public class Scrubber implements Closeable
                                           OperationType.SCRUB,
                                           dataFile.getFilePointer(),
                                           dataFile.length(),
-                                          scrubCompactionId);
+                                          scrubCompactionId,
+                                          ImmutableSet.of(sstable));
             }
             catch (Exception e)
             {
                 throw new RuntimeException(e);
             }
+        }
+
+        public boolean isGlobal()
+        {
+            return false;
         }
     }
 
@@ -758,14 +765,14 @@ public class Scrubber implements Closeable
             {
                 if (cd.column().isSimple())
                 {
-                    Cell cell = (Cell)cd;
+                    Cell<?> cell = (Cell<?>)cd;
                     if (cell.isExpiring() && cell.localDeletionTime() < 0)
                         return true;
                 }
                 else
                 {
                     ComplexColumnData complexData = (ComplexColumnData)cd;
-                    for (Cell cell : complexData)
+                    for (Cell<?> cell : complexData)
                     {
                         if (cell.isExpiring() && cell.localDeletionTime() < 0)
                             return true;
@@ -788,14 +795,14 @@ public class Scrubber implements Closeable
             {
                 if (cd.column().isSimple())
                 {
-                    Cell cell = (Cell)cd;
+                    Cell<?> cell = (Cell<?>)cd;
                     builder.addCell(cell.isExpiring() && cell.localDeletionTime() < 0 ? cell.withUpdatedTimestampAndLocalDeletionTime(cell.timestamp() + 1, AbstractCell.MAX_DELETION_TIME) : cell);
                 }
                 else
                 {
                     ComplexColumnData complexData = (ComplexColumnData)cd;
                     builder.addComplexDeletion(complexData.column(), complexData.complexDeletion());
-                    for (Cell cell : complexData)
+                    for (Cell<?> cell : complexData)
                     {
                         builder.addCell(cell.isExpiring() && cell.localDeletionTime() < 0 ? cell.withUpdatedTimestampAndLocalDeletionTime(cell.timestamp() + 1, AbstractCell.MAX_DELETION_TIME) : cell);
                     }

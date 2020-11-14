@@ -34,6 +34,7 @@ import org.junit.Test;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.Gossiper;
@@ -58,7 +59,9 @@ public class EC2SnitchTest
     @BeforeClass
     public static void setup() throws Exception
     {
+        System.setProperty(Gossiper.Props.DISABLE_THREAD_VALIDATION, "true");
         DatabaseDescriptor.daemonInitialization();
+        CommitLog.instance.start();
         SchemaLoader.mkdirs();
         SchemaLoader.cleanup();
         Keyspace.setInitialized();
@@ -137,7 +140,7 @@ public class EC2SnitchTest
     {
         Set<String> datacenters = new HashSet<>();
         datacenters.add("us-east-1");
-        Assert.assertFalse(Ec2Snitch.validate(datacenters, Collections.emptySet(), true));
+        Assert.assertTrue(Ec2Snitch.validate(datacenters, Collections.emptySet(), true));
     }
 
     @Test
@@ -202,6 +205,33 @@ public class EC2SnitchTest
         Set<String> racks = new HashSet<>();
         racks.add("us-east-1a");
         Assert.assertTrue(Ec2Snitch.validate(datacenters, racks, false));
+    }
+
+    /**
+     * Validate upgrades in legacy mode for regions that didn't change name between the standard and legacy modes.
+     */
+    @Test
+    public void validate_RequiresLegacy_DCValidStandardAndLegacy()
+    {
+        Set<String> datacenters = new HashSet<>();
+        datacenters.add("us-west-2");
+        Set<String> racks = new HashSet<>();
+        racks.add("2a");
+        racks.add("2b");
+        Assert.assertTrue(Ec2Snitch.validate(datacenters, racks, true));
+    }
+
+    /**
+     * Check that racks names are enough to detect a mismatch in naming conventions.
+     */
+    @Test
+    public void validate_RequiresLegacy_RackInvalidForLegacy()
+    {
+        Set<String> datacenters = new HashSet<>();
+        datacenters.add("us-west-2");
+        Set<String> racks = new HashSet<>();
+        racks.add("us-west-2a");
+        Assert.assertFalse(Ec2Snitch.validate(datacenters, racks, true));
     }
 
     @AfterClass

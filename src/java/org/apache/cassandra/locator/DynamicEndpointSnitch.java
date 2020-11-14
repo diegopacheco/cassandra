@@ -35,6 +35,7 @@ import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.EndpointState;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.net.LatencySubscribers;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
@@ -43,7 +44,7 @@ import org.apache.cassandra.utils.MBeanWrapper;
 /**
  * A dynamic snitch that sorts endpoints by latency with an adapted phi failure detector
  */
-public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILatencySubscriber, DynamicEndpointSnitchMBean
+public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements LatencySubscribers.Subscriber, DynamicEndpointSnitchMBean
 {
     private static final boolean USE_SEVERITY = !Boolean.getBoolean("cassandra.ignore_dynamic_snitch_severity");
 
@@ -209,10 +210,12 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
         ArrayList<Double> sortedScores = new ArrayList<>(subsnitchOrderedScores);
         Collections.sort(sortedScores);
 
+        // only calculate this once b/c its volatile and shouldn't be modified during the loop either
+        double badnessThreshold = 1.0 + dynamicBadnessThreshold;
         Iterator<Double> sortedScoreIterator = sortedScores.iterator();
         for (Double subsnitchScore : subsnitchOrderedScores)
         {
-            if (subsnitchScore > (sortedScoreIterator.next() * (1.0 + dynamicBadnessThreshold)))
+            if (subsnitchScore > (sortedScoreIterator.next() * badnessThreshold))
             {
                 return sortedByProximityWithScore(address, replicas);
             }
@@ -253,7 +256,7 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
         throw new UnsupportedOperationException("You shouldn't wrap the DynamicEndpointSnitch (within itself or otherwise)");
     }
 
-    public void receiveTiming(InetAddressAndPort host, long latency) // this is cheap
+    public void receiveTiming(InetAddressAndPort host, long latency, TimeUnit unit) // this is cheap
     {
         ExponentiallyDecayingReservoir sample = samples.get(host);
         if (sample == null)
@@ -263,7 +266,7 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
             if (sample == null)
                 sample = maybeNewSample;
         }
-        sample.update(latency);
+        sample.update(unit.toMillis(latency));
     }
 
     private void updateScores() // this is expensive
@@ -274,7 +277,7 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
         {
             if (MessagingService.instance() != null)
             {
-                MessagingService.instance().register(this);
+                MessagingService.instance().latencySubscribers.subscribe(this);
                 registered = true;
             }
 
@@ -320,9 +323,9 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
         return scores.entrySet().stream().collect(Collectors.toMap(address -> address.getKey().address, Map.Entry::getValue));
     }
 
-    public Map<InetAddressAndPort, Double> getScoresWithPort()
+    public Map<String, Double> getScoresWithPort()
     {
-        return scores;
+        return scores.entrySet().stream().collect(Collectors.toMap(address -> address.getKey().toString(true), Map.Entry::getValue));
     }
 
     public int getUpdateInterval()

@@ -21,8 +21,6 @@ import java.util.*;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.base.Predicate;
-import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.SerializationHeader;
@@ -211,20 +209,20 @@ public abstract class AbstractCompactionStrategy
     public abstract long getMaxSSTableBytes();
 
     /**
-     * Filters SSTables that are to be blacklisted from the given collection
+     * Filters SSTables that are to be excluded from the given collection
      *
-     * @param originalCandidates The collection to check for blacklisted SSTables
-     * @return list of the SSTables with blacklisted ones filtered out
+     * @param originalCandidates The collection to check for excluded SSTables
+     * @return list of the SSTables with excluded ones filtered out
      */
-    public static Iterable<SSTableReader> filterSuspectSSTables(Iterable<SSTableReader> originalCandidates)
+    public static List<SSTableReader> filterSuspectSSTables(Iterable<SSTableReader> originalCandidates)
     {
-        return Iterables.filter(originalCandidates, new Predicate<SSTableReader>()
+        List<SSTableReader> filtered = new ArrayList<>();
+        for (SSTableReader sstable : originalCandidates)
         {
-            public boolean apply(SSTableReader sstable)
-            {
-                return !sstable.isMarkedSuspect();
-            }
-        });
+            if (!sstable.isMarkedSuspect())
+                filtered.add(sstable);
+        }
+        return filtered;
     }
 
 
@@ -254,34 +252,46 @@ public abstract class AbstractCompactionStrategy
         return new ScannerList(scanners);
     }
 
-    public boolean shouldDefragment()
-    {
-        return false;
-    }
-
     public String getName()
     {
         return getClass().getSimpleName();
     }
 
+    /**
+     * Replaces sstables in the compaction strategy
+     *
+     * Note that implementations must be able to handle duplicate notifications here (that removed are already gone and
+     * added have already been added)
+     * */
     public synchronized void replaceSSTables(Collection<SSTableReader> removed, Collection<SSTableReader> added)
     {
         for (SSTableReader remove : removed)
             removeSSTable(remove);
-        for (SSTableReader add : added)
-            addSSTable(add);
+        addSSTables(added);
     }
 
+    /**
+     * Adds sstable, note that implementations must handle duplicate notifications here (added already being in the compaction strategy)
+     */
     public abstract void addSSTable(SSTableReader added);
 
+    /**
+     * Adds sstables, note that implementations must handle duplicate notifications here (added already being in the compaction strategy)
+     */
     public synchronized void addSSTables(Iterable<SSTableReader> added)
     {
         for (SSTableReader sstable : added)
             addSSTable(sstable);
     }
 
+    /**
+     * Removes sstable from the strategy, implementations must be able to handle the sstable having already been removed.
+     */
     public abstract void removeSSTable(SSTableReader sstable);
 
+    /**
+     * Removes sstables from the strategy, implementations must be able to handle the sstables having already been removed.
+     */
     public void removeSSTables(Iterable<SSTableReader> removed)
     {
         for (SSTableReader sstable : removed)
@@ -318,8 +328,8 @@ public abstract class AbstractCompactionStrategy
         public long getTotalBytesScanned()
         {
             long bytesScanned = 0L;
-            for (ISSTableScanner scanner : scanners)
-                bytesScanned += scanner.getBytesScanned();
+            for (int i=0, isize=scanners.size(); i<isize; i++)
+                bytesScanned += scanners.get(i).getBytesScanned();
 
             return bytesScanned;
         }
@@ -327,8 +337,8 @@ public abstract class AbstractCompactionStrategy
         public long getTotalCompressedSize()
         {
             long compressedSize = 0;
-            for (ISSTableScanner scanner : scanners)
-                compressedSize += scanner.getCompressedLengthInBytes();
+            for (int i=0, isize=scanners.size(); i<isize; i++)
+                compressedSize += scanners.get(i).getCompressedLengthInBytes();
 
             return compressedSize;
         }
@@ -338,8 +348,10 @@ public abstract class AbstractCompactionStrategy
             double compressed = 0.0;
             double uncompressed = 0.0;
 
-            for (ISSTableScanner scanner : scanners)
+            for (int i=0, isize=scanners.size(); i<isize; i++)
             {
+                @SuppressWarnings("resource")
+                ISSTableScanner scanner = scanners.get(i);
                 compressed += scanner.getCompressedLengthInBytes();
                 uncompressed += scanner.getLengthInBytes();
             }
@@ -412,8 +424,8 @@ public abstract class AbstractCompactionStrategy
                 ranges.add(new Range<>(overlap.first.getToken(), overlap.last.getToken()));
             long remainingKeys = keys - sstable.estimatedKeysForRanges(ranges);
             // next, calculate what percentage of columns we have within those keys
-            long columns = sstable.getEstimatedColumnCount().mean() * remainingKeys;
-            double remainingColumnsRatio = ((double) columns) / (sstable.getEstimatedColumnCount().count() * sstable.getEstimatedColumnCount().mean());
+            long columns = sstable.getEstimatedCellPerPartitionCount().mean() * remainingKeys;
+            double remainingColumnsRatio = ((double) columns) / (sstable.getEstimatedCellPerPartitionCount().count() * sstable.getEstimatedCellPerPartitionCount().mean());
 
             // return if we still expect to have droppable tombstones in rest of columns
             return remainingColumnsRatio * droppableRatio > tombstoneThreshold;

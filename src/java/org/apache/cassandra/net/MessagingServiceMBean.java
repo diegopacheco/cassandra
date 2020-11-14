@@ -19,6 +19,7 @@ package org.apache.cassandra.net;
 
 
 
+import java.io.IOException;
 import java.net.UnknownHostException;
 import java.util.Map;
 
@@ -116,19 +117,20 @@ public interface MessagingServiceMBean
      */
     @Deprecated
     public Map<String, Double> getBackPressurePerHost();
-    public Map<String, Double> getBackPressurePerHostWithPort();
 
     /**
      * Enable/Disable back-pressure
      */
+    @Deprecated
     public void setBackPressureEnabled(boolean enabled);
 
     /**
      * Get back-pressure enabled state
      */
+    @Deprecated
     public boolean isBackPressureEnabled();
 
     public int getVersion(String address) throws UnknownHostException;
 
-    void reloadSslCertificates();
+    void reloadSslCertificates() throws IOException;
 }

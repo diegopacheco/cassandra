@@ -22,18 +22,21 @@ import static java.lang.String.format;
 import io.airlift.airline.Arguments;
 import io.airlift.airline.Command;
 
+import java.io.PrintStream;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Multimap;
 
 import org.apache.cassandra.db.ColumnFamilyStoreMBean;
 import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.NodeTool.NodeToolCmd;
 import org.apache.cassandra.utils.EstimatedHistogram;
+
 import org.apache.commons.lang3.ArrayUtils;
 
 @Command(name = "tablehistograms", description = "Print statistic histograms for a given table")
@@ -45,40 +48,47 @@ public class TableHistograms extends NodeToolCmd
     @Override
     public void execute(NodeProbe probe)
     {
-        Map<String, List<String>> tablesList = new HashMap<>();
+        PrintStream out = probe.output().out;
+        Multimap<String, String> tablesList = HashMultimap.create();
+
+        // a <keyspace, set<table>> mapping for verification or as reference if none provided
+        Multimap<String, String> allTables = HashMultimap.create();
+        Iterator<Map.Entry<String, ColumnFamilyStoreMBean>> tableMBeans = probe.getColumnFamilyStoreMBeanProxies();
+        while (tableMBeans.hasNext())
+        {
+            Map.Entry<String, ColumnFamilyStoreMBean> entry = tableMBeans.next();
+            allTables.put(entry.getKey(), entry.getValue().getTableName());
+        }
+
         if (args.size() == 2)
         {
-            tablesList.put(args.get(0), new ArrayList<String>(Arrays.asList(args.get(1))));
+            tablesList.put(args.get(0), args.get(1));
         }
         else if (args.size() == 1)
         {
             String[] input = args.get(0).split("\\.");
             checkArgument(input.length == 2, "tablehistograms requires keyspace and table name arguments");
-            tablesList.put(input[0], new ArrayList<String>(Arrays.asList(input[1])));
+            tablesList.put(input[0], input[1]);
         }
         else
         {
-            // get a list of table stores
-            Iterator<Map.Entry<String, ColumnFamilyStoreMBean>> tableMBeans = probe.getColumnFamilyStoreMBeanProxies();
-            while (tableMBeans.hasNext())
+            // use all tables
+            tablesList = allTables;
+        }
+
+        // verify that all tables to list exist
+        for (String keyspace : tablesList.keys())
+        {
+            for (String table : tablesList.get(keyspace))
             {
-                Map.Entry<String, ColumnFamilyStoreMBean> entry = tableMBeans.next();
-                String keyspaceName = entry.getKey();
-                ColumnFamilyStoreMBean tableProxy = entry.getValue();
-                if (!tablesList.containsKey(keyspaceName))
-                {
-                    tablesList.put(keyspaceName, new ArrayList<String>());
-                }
-                tablesList.get(keyspaceName).add(tableProxy.getTableName());
+                if (!allTables.containsEntry(keyspace, table))
+                    throw new IllegalArgumentException("Unknown table " + keyspace + '.' + table);
             }
         }
 
-        Iterator<Map.Entry<String, List<String>>> iter = tablesList.entrySet().iterator();
-        while(iter.hasNext())
+        for (String keyspace : tablesList.keys())
         {
-            Map.Entry<String, List<String>> entry = iter.next();
-            String keyspace = entry.getKey();
-            for (String table : entry.getValue())
+            for (String table : tablesList.get(keyspace))
             {
                 // calculate percentile of row size and column count
                 long[] estimatedPartitionSize = (long[]) probe.getColumnFamilyMetric(keyspace, table, "EstimatedPartitionSizeHistogram");
@@ -91,7 +101,7 @@ public class TableHistograms extends NodeToolCmd
 
                 if (ArrayUtils.isEmpty(estimatedPartitionSize) || ArrayUtils.isEmpty(estimatedColumnCount))
                 {
-                    System.out.println("No SSTables exists, unable to calculate 'Partition Size' and 'Cell Count' percentiles");
+                    out.println("No SSTables exists, unable to calculate 'Partition Size' and 'Cell Count' percentiles");
 
                     for (int i = 0; i < 7; i++)
                     {
@@ -106,7 +116,7 @@ public class TableHistograms extends NodeToolCmd
 
                     if (partitionSizeHist.isOverflowed())
                     {
-                        System.out.println(String.format("Row sizes are larger than %s, unable to calculate percentiles", partitionSizeHist.getLargestBucketOffset()));
+                        out.println(String.format("Row sizes are larger than %s, unable to calculate percentiles", partitionSizeHist.getLargestBucketOffset()));
                         for (int i = 0; i < offsetPercentiles.length; i++)
                             estimatedRowSizePercentiles[i] = Double.NaN;
                     }
@@ -118,7 +128,7 @@ public class TableHistograms extends NodeToolCmd
 
                     if (columnCountHist.isOverflowed())
                     {
-                        System.out.println(String.format("Column counts are larger than %s, unable to calculate percentiles", columnCountHist.getLargestBucketOffset()));
+                        out.println(String.format("Column counts are larger than %s, unable to calculate percentiles", columnCountHist.getLargestBucketOffset()));
                         for (int i = 0; i < estimatedColumnCountPercentiles.length; i++)
                             estimatedColumnCountPercentiles[i] = Double.NaN;
                     }
@@ -137,19 +147,19 @@ public class TableHistograms extends NodeToolCmd
                 }
 
                 String[] percentiles = new String[]{"50%", "75%", "95%", "98%", "99%", "Min", "Max"};
-                double[] readLatency = probe.metricPercentilesAsArray((CassandraMetricsRegistry.JmxTimerMBean) probe.getColumnFamilyMetric(keyspace, table, "ReadLatency"));
-                double[] writeLatency = probe.metricPercentilesAsArray((CassandraMetricsRegistry.JmxTimerMBean) probe.getColumnFamilyMetric(keyspace, table, "WriteLatency"));
-                double[] sstablesPerRead = probe.metricPercentilesAsArray((CassandraMetricsRegistry.JmxHistogramMBean) probe.getColumnFamilyMetric(keyspace, table, "SSTablesPerReadHistogram"));
+                Double[] readLatency = probe.metricPercentilesAsArray((CassandraMetricsRegistry.JmxTimerMBean) probe.getColumnFamilyMetric(keyspace, table, "ReadLatency"));
+                Double[] writeLatency = probe.metricPercentilesAsArray((CassandraMetricsRegistry.JmxTimerMBean) probe.getColumnFamilyMetric(keyspace, table, "WriteLatency"));
+                Double[] sstablesPerRead = probe.metricPercentilesAsArray((CassandraMetricsRegistry.JmxHistogramMBean) probe.getColumnFamilyMetric(keyspace, table, "SSTablesPerReadHistogram"));
 
-                System.out.println(format("%s/%s histograms", keyspace, table));
-                System.out.println(format("%-10s%18s%18s%18s%18s%18s",
+                out.println(format("%s/%s histograms", keyspace, table));
+                out.println(format("%-10s%18s%18s%18s%18s%18s",
                         "Percentile", "Read Latency", "Write Latency", "SSTables", "Partition Size", "Cell Count"));
-                System.out.println(format("%-10s%18s%18s%18s%18s%18s",
+                out.println(format("%-10s%18s%18s%18s%18s%18s",
                         "", "(micros)", "(micros)", "", "(bytes)", ""));
 
                 for (int i = 0; i < percentiles.length; i++)
                 {
-                    System.out.println(format("%-10s%18.2f%18.2f%18.2f%18.0f%18.0f",
+                    out.println(format("%-10s%18.2f%18.2f%18.2f%18.0f%18.0f",
                             percentiles[i],
                             readLatency[i],
                             writeLatency[i],
@@ -157,7 +167,7 @@ public class TableHistograms extends NodeToolCmd
                             estimatedRowSizePercentiles[i],
                             estimatedColumnCountPercentiles[i]));
                 }
-                System.out.println();
+                out.println();
             }
         }
     }

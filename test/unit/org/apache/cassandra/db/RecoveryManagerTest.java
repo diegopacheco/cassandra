@@ -55,6 +55,7 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.compress.DeflateCompressor;
 import org.apache.cassandra.io.compress.LZ4Compressor;
 import org.apache.cassandra.io.compress.SnappyCompressor;
+import org.apache.cassandra.io.compress.ZstdCompressor;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.security.EncryptionContext;
@@ -70,6 +71,7 @@ public class RecoveryManagerTest
 
     private static final String KEYSPACE1 = "RecoveryManagerTest1";
     private static final String CF_STANDARD1 = "Standard1";
+    private static final String CF_STATIC1 = "Static1";
     private static final String CF_COUNTER1 = "Counter1";
 
     private static final String KEYSPACE2 = "RecoveryManagerTest2";
@@ -89,7 +91,8 @@ public class RecoveryManagerTest
             {null, EncryptionContextGenerator.createContext(true)}, // Encryption
             {new ParameterizedClass(LZ4Compressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()},
             {new ParameterizedClass(SnappyCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()},
-            {new ParameterizedClass(DeflateCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()}});
+            {new ParameterizedClass(DeflateCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()},
+            {new ParameterizedClass(ZstdCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()}});
     }
 
     @Before
@@ -105,7 +108,8 @@ public class RecoveryManagerTest
         SchemaLoader.createKeyspace(KEYSPACE1,
                                     KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1),
-                                    SchemaLoader.counterCFMD(KEYSPACE1, CF_COUNTER1));
+                                    SchemaLoader.counterCFMD(KEYSPACE1, CF_COUNTER1),
+                                    SchemaLoader.staticCFMD(KEYSPACE1, CF_STATIC1));
         SchemaLoader.createKeyspace(KEYSPACE2,
                                     KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE2, CF_STANDARD3));
@@ -241,7 +245,7 @@ public class RecoveryManagerTest
 
         ColumnMetadata counterCol = cfs.metadata().getColumn(ByteBufferUtil.bytes("val"));
         Row row = Util.getOnlyRow(Util.cmd(cfs).includeRow("cc").columns("val").build());
-        assertEquals(10L, CounterContext.instance().total(row.getCell(counterCol).value()));
+        assertEquals(10L, CounterContext.instance().total(row.getCell(counterCol)));
     }
 
     @Test
@@ -267,6 +271,34 @@ public class RecoveryManagerTest
         assertEquals(10, Util.getAll(Util.cmd(cfs).build()).size());
 
         keyspace1.getColumnFamilyStore("Standard1").clearUnsafe();
+        CommitLog.instance.resetUnsafe(false);
+
+        assertEquals(6, Util.getAll(Util.cmd(cfs).build()).size());
+    }
+
+    @Test
+    public void testRecoverPITStatic() throws Exception
+    {
+        CommitLog.instance.resetUnsafe(true);
+        Keyspace keyspace1 = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace1.getColumnFamilyStore(CF_STATIC1);
+        Date date = CommitLogArchiver.format.parse("2112:12:12 12:12:12");
+        long timeMS = date.getTime() - 5000;
+
+
+        for (int i = 0; i < 10; ++i)
+        {
+            long ts = TimeUnit.MILLISECONDS.toMicros(timeMS + (i * 1000));
+            new RowUpdateBuilder(cfs.metadata(), ts, "name-" + i)
+            .add("val", Integer.toString(i))
+            .build()
+            .apply();
+        }
+
+        // Sanity check row count prior to clear and replay
+        assertEquals(10, Util.getAll(Util.cmd(cfs).build()).size());
+
+        keyspace1.getColumnFamilyStore(CF_STATIC1).clearUnsafe();
         CommitLog.instance.resetUnsafe(false);
 
         assertEquals(6, Util.getAll(Util.cmd(cfs).build()).size());

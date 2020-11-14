@@ -46,7 +46,7 @@ Commitlogs are an append only log of all mutations local to a Cassandra node. An
     - ``commitlog_sync_period_in_ms``: Time to wait between "periodic" fsyncs
     *Default Value:* 10000
 
-*Default Value:* batch
+*Default Value:* periodic
 
 *** NOTE: In the event of an unexpected shutdown, Cassandra can lose up to the sync period or more if the sync is delayed. If using "batch" mode, it is recommended to store commitlogs in a separate, dedicated device.**
 
@@ -55,7 +55,7 @@ Commitlogs are an append only log of all mutations local to a Cassandra node. An
 
 *Default Value:* /var/lib/cassandra/commitlog
 
-- ``commitlog_compression``: Compression to apply to the commitlog. If omitted, the commit log will be written uncompressed.  LZ4, Snappy, and Deflate compressors are supported.
+- ``commitlog_compression``: Compression to apply to the commitlog. If omitted, the commit log will be written uncompressed. LZ4, Snappy, Deflate and Zstd compressors are supported.
 
 (Default Value: (complex option)::
 

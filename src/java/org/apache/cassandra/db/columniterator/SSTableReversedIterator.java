@@ -108,7 +108,7 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
                     // FIXME: so far we only keep stats on cells, so to get a rough estimate on the number of rows,
                     // we divide by the number of regular columns the table has. We should fix once we collect the
                     // stats on rows
-                    int estimatedRowsPerPartition = (int)(sstable.getEstimatedColumnCount().percentile(0.75) / columnCount);
+                    int estimatedRowsPerPartition = (int)(sstable.getEstimatedCellPerPartitionCount().percentile(0.75) / columnCount);
                     estimatedRowCount = Math.max(estimatedRowsPerPartition / blocksCount, 1);
                 }
                 catch (IllegalStateException e)
@@ -172,8 +172,8 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
 
         // Reads the unfiltered from disk and load them into the reader buffer. It stops reading when either the partition
         // is fully read, or when stopReadingDisk() returns true.
-        protected void loadFromDisk(ClusteringBound start,
-                                    ClusteringBound end,
+        protected void loadFromDisk(ClusteringBound<?> start,
+                                    ClusteringBound<?> end,
                                     boolean hasPreviousBlock,
                                     boolean hasNextBlock) throws IOException
         {
@@ -209,7 +209,7 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
                 // want to "return" it just yet, we'll wait until we reach it in the next blocks. That's why we trigger
                 // skipLastIteratedItem in that case (this is first item of the block, but we're iterating in reverse order
                 // so it will be last returned by the iterator).
-                ClusteringBound markerStart = start == null ? ClusteringBound.BOTTOM : start;
+                ClusteringBound<?> markerStart = start == null ? BufferClusteringBound.BOTTOM : start;
                 buffer.add(new RangeTombstoneBoundMarker(markerStart, openMarker));
                 if (hasNextBlock)
                     skipLastIteratedItem = true;
@@ -243,7 +243,7 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
                 // not breaking ImmutableBTreePartition, we should skip it when returning from the iterator, hence the
                 // skipFirstIteratedItem (this is the last item of the block, but we're iterating in reverse order so it will
                 // be the first returned by the iterator).
-                ClusteringBound markerEnd = end == null ? ClusteringBound.TOP : end;
+                ClusteringBound<?> markerEnd = end == null ? BufferClusteringBound.TOP : end;
                 buffer.add(new RangeTombstoneBoundMarker(markerEnd, openMarker));
                 if (hasPreviousBlock)
                     skipFirstIteratedItem = true;

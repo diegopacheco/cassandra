@@ -25,6 +25,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import org.junit.Test;
 
+import org.apache.cassandra.db.Digest;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Range;
@@ -40,6 +41,13 @@ import static org.junit.Assert.assertTrue;
 
 public class DifferenceHolderTest
 {
+    private static byte[] digest(String string)
+    {
+        return Digest.forValidator()
+                     .update(string.getBytes(), 0, string.getBytes().length)
+                     .digest();
+    }
+
     @Test
     public void testFromEmptyMerkleTrees() throws UnknownHostException
     {
@@ -74,9 +82,9 @@ public class DifferenceHolderTest
         mt1.init();
         mt2.init();
         // add dummy hashes to both trees
-        for (MerkleTree.TreeRange range : mt1.invalids())
+        for (MerkleTree.TreeRange range : mt1.rangeIterator())
             range.addAll(new MerkleTreesTest.HIterator(range.right));
-        for (MerkleTree.TreeRange range : mt2.invalids())
+        for (MerkleTree.TreeRange range : mt2.rangeIterator())
             range.addAll(new MerkleTreesTest.HIterator(range.right));
 
         MerkleTree.TreeRange leftmost = null;
@@ -85,14 +93,14 @@ public class DifferenceHolderTest
         mt1.maxsize(fullRange, maxsize + 2); // give some room for splitting
 
         // split the leftmost
-        Iterator<MerkleTree.TreeRange> ranges = mt1.invalids();
+        Iterator<MerkleTree.TreeRange> ranges = mt1.rangeIterator();
         leftmost = ranges.next();
         mt1.split(leftmost.right);
 
         // set the hashes for the leaf of the created split
         middle = mt1.get(leftmost.right);
-        middle.hash("arbitrary!".getBytes());
-        mt1.get(partitioner.midpoint(leftmost.left, leftmost.right)).hash("even more arbitrary!".getBytes());
+        middle.hash(digest("arbitrary!"));
+        mt1.get(partitioner.midpoint(leftmost.left, leftmost.right)).hash(digest("even more arbitrary!"));
 
         TreeResponse tr1 = new TreeResponse(a1, mt1);
         TreeResponse tr2 = new TreeResponse(a2, mt2);

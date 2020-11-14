@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 import com.google.common.collect.ImmutableSet;
 
@@ -38,16 +39,14 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.io.util.ChannelProxy;
 import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.Memory;
-import org.apache.cassandra.schema.CachingParams;
-import org.apache.cassandra.schema.KeyspaceMetadata;
-import org.apache.cassandra.schema.KeyspaceParams;
-import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.AlwaysPresentFilter;
 import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.apache.cassandra.service.ActiveRepairService.UNREPAIRED_SSTABLE;
 
 public class MockSchema
 {
@@ -61,7 +60,8 @@ public class MockSchema
     public static final Keyspace ks = Keyspace.mockKS(KeyspaceMetadata.create("mockks", KeyspaceParams.simpleTransient(1)));
 
     public static final IndexSummary indexSummary;
-    private static final FileHandle RANDOM_ACCESS_READER_FACTORY = new FileHandle.Builder(temp("mocksegmentedfile").getAbsolutePath()).complete();
+
+    private static final File tempFile = temp("mocksegmentedfile");
 
     public static Memtable memtable(ColumnFamilyStore cfs)
     {
@@ -92,7 +92,17 @@ public class MockSchema
         return sstable(generation, size, keepRef, generation, generation, cfs);
     }
 
+    public static SSTableReader sstableWithLevel(int generation, long firstToken, long lastToken, int level, ColumnFamilyStore cfs)
+    {
+        return sstable(generation, 0, false, firstToken, lastToken, level, cfs);
+    }
+
     public static SSTableReader sstable(int generation, int size, boolean keepRef, long firstToken, long lastToken, ColumnFamilyStore cfs)
+    {
+        return sstable(generation, size, keepRef, firstToken, lastToken, 0, cfs);
+    }
+
+    public static SSTableReader sstable(int generation, int size, boolean keepRef, long firstToken, long lastToken, int level, ColumnFamilyStore cfs)
     {
         Descriptor descriptor = new Descriptor(cfs.getDirectories().getDirectoryForNewSSTables(),
                                                cfs.keyspace.getName(),
@@ -110,33 +120,40 @@ public class MockSchema
             {
             }
         }
-        if (size > 0)
+        // .complete() with size to make sstable.onDiskLength work
+        try (FileHandle.Builder builder = new FileHandle.Builder(new ChannelProxy(tempFile)).bufferSize(size);
+             FileHandle fileHandle = builder.complete(size))
         {
-            try
+            if (size > 0)
             {
-                File file = new File(descriptor.filenameFor(Component.DATA));
-                try (RandomAccessFile raf = new RandomAccessFile(file, "rw"))
+                try
                 {
-                    raf.setLength(size);
+                    File file = new File(descriptor.filenameFor(Component.DATA));
+                    try (RandomAccessFile raf = new RandomAccessFile(file, "rw"))
+                    {
+                        raf.setLength(size);
+                    }
+                }
+                catch (IOException e)
+                {
+                    throw new RuntimeException(e);
                 }
             }
-            catch (IOException e)
-            {
-                throw new RuntimeException(e);
-            }
+            SerializationHeader header = SerializationHeader.make(cfs.metadata(), Collections.emptyList());
+            StatsMetadata metadata = (StatsMetadata) new MetadataCollector(cfs.metadata().comparator)
+                                                     .sstableLevel(level)
+                                                     .finalizeMetadata(cfs.metadata().partitioner.getClass().getCanonicalName(), 0.01f, UNREPAIRED_SSTABLE, null, false, header)
+                                                     .get(MetadataType.STATS);
+            SSTableReader reader = SSTableReader.internalOpen(descriptor, components, cfs.metadata,
+                                                              fileHandle.sharedCopy(), fileHandle.sharedCopy(), indexSummary.sharedCopy(),
+                                                              new AlwaysPresentFilter(), 1L, metadata, SSTableReader.OpenReason.NORMAL, header);
+            reader.first = readerBounds(firstToken);
+            reader.last = readerBounds(lastToken);
+            if (!keepRef)
+                reader.selfRef().release();
+            return reader;
         }
-        SerializationHeader header = SerializationHeader.make(cfs.metadata(), Collections.emptyList());
-        StatsMetadata metadata = (StatsMetadata) new MetadataCollector(cfs.metadata().comparator)
-                                                 .finalizeMetadata(cfs.metadata().partitioner.getClass().getCanonicalName(), 0.01f, -1, null, false, header)
-                                                 .get(MetadataType.STATS);
-        SSTableReader reader = SSTableReader.internalOpen(descriptor, components, cfs.metadata,
-                                                          RANDOM_ACCESS_READER_FACTORY.sharedCopy(), RANDOM_ACCESS_READER_FACTORY.sharedCopy(), indexSummary.sharedCopy(),
-                                                          new AlwaysPresentFilter(), 1L, metadata, SSTableReader.OpenReason.NORMAL, header);
-        reader.first = readerBounds(firstToken);
-        reader.last = readerBounds(lastToken);
-        if (!keepRef)
-            reader.selfRef().release();
-        return reader;
+
     }
 
     public static ColumnFamilyStore newCFS()
@@ -146,20 +163,47 @@ public class MockSchema
 
     public static ColumnFamilyStore newCFS(String ksname)
     {
-        String cfname = "mockcf" + (id.incrementAndGet());
-        TableMetadata metadata = newTableMetadata(ksname, cfname);
-        return new ColumnFamilyStore(ks, cfname, 0, new TableMetadataRef(metadata), new Directories(metadata), false, false, false);
+        return newCFS(newTableMetadata(ksname));
+    }
+
+    public static ColumnFamilyStore newCFS(Function<TableMetadata.Builder, TableMetadata.Builder> options)
+    {
+        return newCFS(ks.getName(), options);
+    }
+
+    public static ColumnFamilyStore newCFS(String ksname, Function<TableMetadata.Builder, TableMetadata.Builder> options)
+    {
+        return newCFS(options.apply(newTableMetadataBuilder(ksname)).build());
+    }
+
+    public static ColumnFamilyStore newCFS(TableMetadata metadata)
+    {
+        return new ColumnFamilyStore(ks, metadata.name, 0, new TableMetadataRef(metadata), new Directories(metadata), false, false, false);
+    }
+
+    public static TableMetadata newTableMetadata(String ksname)
+    {
+        return newTableMetadata(ksname, "mockcf" + (id.incrementAndGet()));
     }
 
     public static TableMetadata newTableMetadata(String ksname, String cfname)
+    {
+        return newTableMetadataBuilder(ksname, cfname).build();
+    }
+
+    public static TableMetadata.Builder newTableMetadataBuilder(String ksname)
+    {
+        return newTableMetadataBuilder(ksname, "mockcf" + (id.incrementAndGet()));
+    }
+
+    public static TableMetadata.Builder newTableMetadataBuilder(String ksname, String cfname)
     {
         return TableMetadata.builder(ksname, cfname)
                             .partitioner(Murmur3Partitioner.instance)
                             .addPartitionKeyColumn("key", UTF8Type.instance)
                             .addClusteringColumn("col", UTF8Type.instance)
                             .addRegularColumn("value", UTF8Type.instance)
-                            .caching(CachingParams.CACHE_NOTHING)
-                            .build();
+                            .caching(CachingParams.CACHE_NOTHING);
     }
 
     public static BufferDecoratedKey readerBounds(long generation)

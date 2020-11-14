@@ -19,7 +19,6 @@
 package org.apache.cassandra.db.streaming;
 
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.nio.channels.FileChannel;
 
 import org.slf4j.Logger;
@@ -27,7 +26,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.net.async.ByteBufDataOutputStreamPlus;
+import org.apache.cassandra.net.AsyncStreamingOutputPlus;
 import org.apache.cassandra.streaming.ProgressInfo;
 import org.apache.cassandra.streaming.StreamManager;
 import org.apache.cassandra.streaming.StreamSession;
@@ -43,26 +42,28 @@ public class CassandraEntireSSTableStreamWriter
     private static final Logger logger = LoggerFactory.getLogger(CassandraEntireSSTableStreamWriter.class);
 
     private final SSTableReader sstable;
+    private final ComponentContext context;
     private final ComponentManifest manifest;
     private final StreamSession session;
     private final StreamRateLimiter limiter;
 
-    public CassandraEntireSSTableStreamWriter(SSTableReader sstable, StreamSession session, ComponentManifest manifest)
+    public CassandraEntireSSTableStreamWriter(SSTableReader sstable, StreamSession session, ComponentContext context)
     {
         this.session = session;
         this.sstable = sstable;
-        this.manifest = manifest;
+        this.context = context;
+        this.manifest = context.manifest();
         this.limiter = StreamManager.getRateLimiter(session.peer);
     }
 
     /**
      * Stream the entire file to given channel.
      * <p>
-     *
+     * TODO: this currently requires a companion thread, but could be performed entirely asynchronously
      * @param out where this writes data to
      * @throws IOException on any I/O error
      */
-    public void write(ByteBufDataOutputStreamPlus out) throws IOException
+    public void write(AsyncStreamingOutputPlus out) throws IOException
     {
         long totalSize = manifest.totalSize();
         logger.debug("[Stream #{}] Start streaming sstable {} to {}, repairedAt = {}, totalSize = {}",
@@ -76,11 +77,8 @@ public class CassandraEntireSSTableStreamWriter
 
         for (Component component : manifest.components())
         {
-            @SuppressWarnings("resource") // this is closed after the file is transferred by ByteBufDataOutputStreamPlus
-            FileChannel in = new RandomAccessFile(sstable.descriptor.filenameFor(component), "r").getChannel();
-
             // Total Length to transmit for this file
-            long length = in.size();
+            long length = manifest.sizeOf(component);
 
             // tracks write progress
             logger.debug("[Stream #{}] Streaming {}.{} gen {} component {} size {}", session.planId(),
@@ -90,7 +88,9 @@ public class CassandraEntireSSTableStreamWriter
                          component,
                          prettyPrintMemory(length));
 
-            long bytesWritten = out.writeToChannel(in, limiter);
+            @SuppressWarnings("resource") // this is closed after the file is transferred by AsyncChannelOutputPlus
+            FileChannel channel = context.channel(sstable.descriptor, component, length);
+            long bytesWritten = out.writeFileToChannel(channel, limiter);
             progress += bytesWritten;
 
             session.progress(sstable.descriptor.filenameFor(component), ProgressInfo.Direction.OUT, bytesWritten, length);

@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 import com.google.common.collect.Lists;
@@ -43,6 +44,7 @@ import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.locator.RangesAtEndpoint;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.repair.AbstractRepairTest;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.repair.KeyspaceRepairManager;
@@ -70,6 +72,8 @@ import static org.apache.cassandra.repair.consistent.ConsistentSession.State.*;
 
 public class LocalSessionTest extends AbstractRepairTest
 {
+    private static final UUID TID1 = UUIDGen.getTimeUUID();
+    private static final UUID TID2 = UUIDGen.getTimeUUID();
 
     static LocalSession.Builder createBuilder()
     {
@@ -77,7 +81,7 @@ public class LocalSessionTest extends AbstractRepairTest
         builder.withState(PREPARING);
         builder.withSessionID(UUIDGen.getTimeUUID());
         builder.withCoordinator(COORDINATOR);
-        builder.withUUIDTableIds(Sets.newHashSet(UUIDGen.getTimeUUID(), UUIDGen.getTimeUUID()));
+        builder.withUUIDTableIds(Sets.newHashSet(TID1, TID2));
         builder.withRepairedAt(System.currentTimeMillis());
         builder.withRanges(Sets.newHashSet(RANGE1, RANGE2, RANGE3));
         builder.withParticipants(Sets.newHashSet(PARTICIPANT1, PARTICIPANT2, PARTICIPANT3));
@@ -122,13 +126,14 @@ public class LocalSessionTest extends AbstractRepairTest
     static class InstrumentedLocalSessions extends LocalSessions
     {
         Map<InetAddressAndPort, List<RepairMessage>> sentMessages = new HashMap<>();
-        protected void sendMessage(InetAddressAndPort destination, RepairMessage message)
+
+        protected void sendMessage(InetAddressAndPort destination, Message<? extends RepairMessage> message)
         {
             if (!sentMessages.containsKey(destination))
             {
                 sentMessages.put(destination, new ArrayList<>());
             }
-            sentMessages.get(destination).add(message);
+            sentMessages.get(destination).add(message.payload);
         }
 
         SettableFuture<Object> prepareSessionFuture = null;
@@ -139,7 +144,8 @@ public class LocalSessionTest extends AbstractRepairTest
                                         UUID sessionID,
                                         Collection<ColumnFamilyStore> tables,
                                         RangesAtEndpoint ranges,
-                                        ExecutorService executor)
+                                        ExecutorService executor,
+                                        BooleanSupplier isCancelled)
         {
             prepareSessionCalled = true;
             if (prepareSessionFuture != null)
@@ -148,7 +154,7 @@ public class LocalSessionTest extends AbstractRepairTest
             }
             else
             {
-                return super.prepareSession(repairManager, sessionID, tables, ranges, executor);
+                return super.prepareSession(repairManager, sessionID, tables, ranges, executor, isCancelled);
             }
         }
 
@@ -334,7 +340,41 @@ public class LocalSessionTest extends AbstractRepairTest
         InstrumentedLocalSessions sessions = new InstrumentedLocalSessions();
         sessions.handlePrepareMessage(PARTICIPANT1, new PrepareConsistentRequest(sessionID, COORDINATOR, PARTICIPANTS));
         Assert.assertNull(sessions.getSession(sessionID));
-        assertMessagesSent(sessions, COORDINATOR, new FailSession(sessionID));
+        assertMessagesSent(sessions, COORDINATOR, new PrepareConsistentResponse(sessionID, PARTICIPANT1, false));
+    }
+
+    /**
+     * If the session is cancelled mid-prepare, the isCancelled boolean supplier should start returning true
+     */
+    @Test
+    public void prepareCancellation()
+    {
+        UUID sessionID = registerSession();
+        AtomicReference<BooleanSupplier> isCancelledRef = new AtomicReference<>();
+        SettableFuture future = SettableFuture.create();
+
+        InstrumentedLocalSessions sessions = new InstrumentedLocalSessions() {
+            ListenableFuture prepareSession(KeyspaceRepairManager repairManager, UUID sessionID, Collection<ColumnFamilyStore> tables, RangesAtEndpoint ranges, ExecutorService executor, BooleanSupplier isCancelled)
+            {
+                isCancelledRef.set(isCancelled);
+                return future;
+            }
+        };
+        sessions.start();
+
+        sessions.handlePrepareMessage(PARTICIPANT1, new PrepareConsistentRequest(sessionID, COORDINATOR, PARTICIPANTS));
+
+        BooleanSupplier isCancelled = isCancelledRef.get();
+        Assert.assertNotNull(isCancelled);
+        Assert.assertFalse(isCancelled.getAsBoolean());
+        Assert.assertTrue(sessions.sentMessages.isEmpty());
+
+        sessions.failSession(sessionID, false);
+        Assert.assertTrue(isCancelled.getAsBoolean());
+
+        // now that the session has failed, it send a negative response to the coordinator (even if the anti-compaction completed successfully)
+        future.set(new Object());
+        assertMessagesSent(sessions, COORDINATOR, new PrepareConsistentResponse(sessionID, PARTICIPANT1, false));
     }
 
     @Test
@@ -832,6 +872,7 @@ public class LocalSessionTest extends AbstractRepairTest
     {
         LocalSession.Builder builder = createBuilder();
         builder.withStartedAt(started);
+        builder.withRepairedAt(started);
         builder.withLastUpdate(updated);
         return builder.build();
     }
@@ -902,11 +943,26 @@ public class LocalSessionTest extends AbstractRepairTest
 
         sessions.cleanup();
 
+        // failed session should be gone, but finalized should not, since it hasn't been superseded
         Assert.assertNull(sessions.getSession(failed.sessionID));
-        Assert.assertNull(sessions.getSession(finalized.sessionID));
+        Assert.assertNotNull(sessions.getSession(finalized.sessionID));
 
         Assert.assertNull(sessions.loadUnsafe(failed.sessionID));
+        Assert.assertNotNull(sessions.loadUnsafe(finalized.sessionID));
+
+        // add a finalized superseding session
+        LocalSession superseding = sessionWithTime(time, time + 1);
+        superseding.setState(FINALIZED);
+        sessions.putSessionUnsafe(superseding);
+
+        sessions.cleanup();
+
+        // old finalized should be removed, superseding should still be there
+        Assert.assertNull(sessions.getSession(finalized.sessionID));
+        Assert.assertNotNull(sessions.getSession(superseding.sessionID));
+
         Assert.assertNull(sessions.loadUnsafe(finalized.sessionID));
+        Assert.assertNotNull(sessions.loadUnsafe(superseding.sessionID));
     }
 
     /**

@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import com.google.common.base.Joiner;
 import com.google.common.collect.Sets;
@@ -33,7 +34,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.audit.AuditLogOptions;
-import org.apache.cassandra.audit.FullQueryLoggerOptions;
+import org.apache.cassandra.fql.FullQueryLoggerOptions;
 import org.apache.cassandra.db.ConsistencyLevel;
 
 /**
@@ -85,6 +86,10 @@ public class Config
     public int num_tokens = 1;
     /** Triggers automatic allocation of tokens if set, using the replication strategy of the referenced keyspace */
     public String allocate_tokens_for_keyspace = null;
+    /** Triggers automatic allocation of tokens if set, based on the provided replica count for a datacenter */
+    public Integer allocate_tokens_for_local_replication_factor = null;
+
+    public long native_transport_idle_timeout_in_ms = 0L;
 
     public volatile long request_timeout_in_ms = 10000L;
 
@@ -103,7 +108,7 @@ public class Config
     public Integer streaming_connections_per_host = 1;
     public Integer streaming_keep_alive_period_in_secs = 300; //5 minutes
 
-    public boolean cross_node_timeout = false;
+    public boolean cross_node_timeout = true;
 
     public volatile long slow_query_log_timeout_in_ms = 500L;
 
@@ -121,6 +126,13 @@ public class Config
     public Integer memtable_heap_space_in_mb;
     public Integer memtable_offheap_space_in_mb;
     public Float memtable_cleanup_threshold = null;
+
+    // Limit the maximum depth of repair session merkle trees
+    @Deprecated
+    public volatile Integer repair_session_max_tree_depth = null;
+    public volatile Integer repair_session_space_in_mb = null;
+
+    public volatile boolean use_offheap_merkle_trees = true;
 
     public int storage_port = 7000;
     public int ssl_storage_port = 7001;
@@ -143,8 +155,21 @@ public class Config
     public boolean rpc_interface_prefer_ipv6 = false;
     public String broadcast_rpc_address;
     public boolean rpc_keepalive = true;
-    public int internode_send_buff_size_in_bytes = 0;
-    public int internode_recv_buff_size_in_bytes = 0;
+
+    public Integer internode_max_message_size_in_bytes;
+
+    public int internode_socket_send_buffer_size_in_bytes = 0;
+    public int internode_socket_receive_buffer_size_in_bytes = 0;
+
+    // TODO: derive defaults from system memory settings?
+    public int internode_application_send_queue_capacity_in_bytes = 1 << 22; // 4MiB
+    public int internode_application_send_queue_reserve_endpoint_capacity_in_bytes = 1 << 27; // 128MiB
+    public int internode_application_send_queue_reserve_global_capacity_in_bytes = 1 << 29; // 512MiB
+
+    public int internode_application_receive_queue_capacity_in_bytes = 1 << 22; // 4MiB
+    public int internode_application_receive_queue_reserve_endpoint_capacity_in_bytes = 1 << 27; // 128MiB
+    public int internode_application_receive_queue_reserve_global_capacity_in_bytes = 1 << 29; // 512MiB
+
     // Defensive settings for protecting Cassandra from true network partitions. See (CASSANDRA-14358) for details.
     // The amount of time to wait for internode tcp connections to establish.
     public int internode_tcp_connect_timeout_in_ms = 2000;
@@ -164,6 +189,11 @@ public class Config
     public boolean native_transport_flush_in_batches_legacy = false;
     public volatile boolean native_transport_allow_older_protocols = true;
     public int native_transport_frame_block_size_in_kb = 32;
+    public volatile long native_transport_max_concurrent_requests_in_bytes_per_ip = -1L;
+    public volatile long native_transport_max_concurrent_requests_in_bytes = -1L;
+    @Deprecated
+    public Integer native_transport_max_negotiable_protocol_version = null;
+
 
     /**
      * Max size of values in SSTables, in MegaBytes.
@@ -174,10 +204,11 @@ public class Config
 
     public boolean snapshot_before_compaction = false;
     public boolean auto_snapshot = true;
+    public volatile long snapshot_links_per_second = 0;
 
     /* if the size of columns or super-columns are more than this, indexing will kick in */
     public int column_index_size_in_kb = 64;
-    public int column_index_cache_size_in_kb = 2;
+    public volatile int column_index_cache_size_in_kb = 2;
     public volatile int batch_size_warn_threshold_in_kb = 5;
     public volatile int batch_size_fail_threshold_in_kb = 50;
     public Integer unlogged_batch_across_partitions_warn_threshold = 10;
@@ -186,8 +217,8 @@ public class Config
     public volatile int compaction_large_partition_warning_threshold_mb = 100;
     public int min_free_space_per_drive_in_mb = 50;
 
-    public volatile int concurrent_validations = Integer.MAX_VALUE;
     public volatile int concurrent_materialized_view_builders = 1;
+    public volatile int reject_repair_compaction_threshold = Integer.MAX_VALUE;
 
     /**
      * @deprecated retry support removed on CASSANDRA-10992
@@ -215,6 +246,7 @@ public class Config
     public int commitlog_sync_period_in_ms;
     public int commitlog_segment_size_in_mb = 32;
     public ParameterizedClass commitlog_compression;
+    public FlushCompression flush_compression = FlushCompression.fast;
     public int commitlog_max_compression_buffers_in_pool = 3;
     public Integer periodic_commitlog_sync_lag_block_in_ms;
     public TransparentDataEncryptionOptions transparent_data_encryption_options = new TransparentDataEncryptionOptions();
@@ -247,12 +279,14 @@ public class Config
     public int hints_flush_period_in_ms = 10000;
     public int max_hints_file_size_in_mb = 128;
     public ParameterizedClass hints_compression;
-    public int sstable_preemptive_open_interval_in_mb = 50;
 
     public volatile boolean incremental_backups = false;
     public boolean trickle_fsync = false;
     public int trickle_fsync_interval_in_kb = 10240;
 
+    public volatile int sstable_preemptive_open_interval_in_mb = 50;
+
+    public volatile boolean key_cache_migrate_during_compaction = true;
     public Long key_cache_size_in_mb = null;
     public volatile int key_cache_save_period = 14400;
     public volatile int key_cache_keys_to_save = Integer.MAX_VALUE;
@@ -267,8 +301,13 @@ public class Config
     public volatile int counter_cache_keys_to_save = Integer.MAX_VALUE;
 
     private static boolean isClientMode = false;
+    private static Supplier<Config> overrideLoadConfig = null;
+
+    public Integer networking_cache_size_in_mb;
 
     public Integer file_cache_size_in_mb;
+
+    public boolean file_cache_enabled = Boolean.getBoolean("cassandra.file_cache_enabled");
 
     /**
      * Because of the current {@link org.apache.cassandra.utils.memory.BufferPool} slab sizes of 64 kb, we
@@ -281,7 +320,8 @@ public class Config
      */
     public Boolean file_cache_round_up;
 
-    public boolean buffer_pool_use_heap_if_exhausted = true;
+    @Deprecated
+    public boolean buffer_pool_use_heap_if_exhausted;
 
     public DiskOptimizationStrategy disk_optimization_strategy = DiskOptimizationStrategy.ssd;
 
@@ -295,6 +335,8 @@ public class Config
 
     public volatile int tombstone_warn_threshold = 1000;
     public volatile int tombstone_failure_threshold = 100000;
+
+    public final ReplicaFilteringProtectionOptions replica_filtering_protection = new ReplicaFilteringProtectionOptions();
 
     public volatile Long index_summary_capacity_in_mb;
     public volatile int index_summary_resize_interval_in_minutes = 60;
@@ -313,7 +355,7 @@ public class Config
     public volatile ConsistencyLevel ideal_consistency_level = null;
 
     /*
-     * Strategy to use for coalescing messages in {@link OutboundMessagingPool}.
+     * Strategy to use for coalescing messages in {@link OutboundConnections}.
      * Can be fixed, movingaverage, timehorizon, disabled. Setting is case and leading/trailing
      * whitespace insensitive. You can also specify a subclass of
      * {@link org.apache.cassandra.utils.CoalescingStrategies.CoalescingStrategy} by name.
@@ -330,12 +372,6 @@ public class Config
     public int otc_coalescing_window_us = otc_coalescing_window_us_default;
     public int otc_coalescing_enough_coalesced_messages = 8;
 
-    /**
-     * Backlog expiration interval in milliseconds for the OutboundTcpConnection.
-     */
-    public static final int otc_backlog_expiration_interval_ms_default = 200;
-    public volatile int otc_backlog_expiration_interval_ms = otc_backlog_expiration_interval_ms_default;
-
     public int windows_timer_interval = 0;
 
     /**
@@ -347,9 +383,11 @@ public class Config
     public boolean enable_user_defined_functions = false;
     public boolean enable_scripted_user_defined_functions = false;
 
-    public boolean enable_materialized_views = true;
+    public boolean enable_materialized_views = false;
 
     public boolean enable_transient_replication = false;
+
+    public boolean enable_sasi_indexes = false;
 
     /**
      * Optionally disable asynchronous UDF execution.
@@ -382,9 +420,12 @@ public class Config
      */
     public UserFunctionTimeoutPolicy user_function_timeout_policy = UserFunctionTimeoutPolicy.die;
 
+    @Deprecated
     public volatile boolean back_pressure_enabled = false;
+    @Deprecated
     public volatile ParameterizedClass back_pressure_strategy;
 
+    public volatile int concurrent_validations;
     public RepairCommandPoolFullStrategy repair_command_pool_full_strategy = RepairCommandPoolFullStrategy.queue;
     public int repair_command_pool_size = concurrent_validations;
 
@@ -440,6 +481,28 @@ public class Config
      * and has no other effect on the collection or processing of the repaired data.
      */
     public volatile boolean report_unconfirmed_repaired_data_mismatches = false;
+    /*
+     * If true, when a repaired data mismatch is detected at read time or during a preview repair,
+     * a snapshot request will be issued to each particpating replica. These are limited at the replica level
+     * so that only a single snapshot per-table per-day can be taken via this method.
+     */
+    public volatile boolean snapshot_on_repaired_data_mismatch = false;
+
+    /**
+     * number of seconds to set nowInSec into the future when performing validation previews against repaired data
+     * this (attempts) to prevent a race where validations on different machines are started on different sides of
+     * a tombstone being compacted away
+     */
+    public volatile int validation_preview_purge_head_start_in_sec = 60 * 60;
+
+    /**
+     * The intial capacity for creating RangeTombstoneList.
+     */
+    public volatile int initial_range_tombstone_list_allocation_size = 1;
+    /**
+     * The growth factor to enlarge a RangeTombstoneList.
+     */
+    public volatile double range_tombstone_list_growth_factor = 1.5;
 
     /**
      * @deprecated migrate to {@link DatabaseDescriptor#isClientInitialized()}
@@ -449,6 +512,26 @@ public class Config
     {
         return isClientMode;
     }
+
+    /**
+     * If true, when rows with duplicate clustering keys are detected during a read or compaction
+     * a snapshot will be taken. In the read case, each a snapshot request will be issued to each
+     * replica involved in the query, for compaction the snapshot will be created locally.
+     * These are limited at the replica level so that only a single snapshot per-day can be taken
+     * via this method.
+     *
+     * This requires check_for_duplicate_rows_during_reads and/or check_for_duplicate_rows_during_compaction
+     * below to be enabled
+     */
+    public volatile boolean snapshot_on_duplicate_row_detection = false;
+    /**
+     * If these are enabled duplicate keys will get logged, and if snapshot_on_duplicate_row_detection
+     * is enabled, the table will get snapshotted for offline investigation
+     */
+    public volatile boolean check_for_duplicate_rows_during_reads = true;
+    public volatile boolean check_for_duplicate_rows_during_compaction = true;
+
+    public boolean autocompaction_on_startup_enabled = Boolean.parseBoolean(System.getProperty("cassandra.autocompaction_on_startup_enabled", "true"));
 
     /**
      * Client mode means that the process is a pure client, that uses C* code base but does
@@ -462,12 +545,30 @@ public class Config
         isClientMode = clientMode;
     }
 
+    public static Supplier<Config> getOverrideLoadConfig()
+    {
+        return overrideLoadConfig;
+    }
+
+    public static void setOverrideLoadConfig(Supplier<Config> loadConfig)
+    {
+        overrideLoadConfig = loadConfig;
+    }
+
     public enum CommitLogSync
     {
         periodic,
         batch,
         group
     }
+
+    public enum FlushCompression
+    {
+        none,
+        fast,
+        table
+    }
+
     public enum InternodeCompression
     {
         all, none, dc

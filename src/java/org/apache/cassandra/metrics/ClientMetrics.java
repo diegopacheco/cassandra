@@ -19,9 +19,12 @@
 package org.apache.cassandra.metrics;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.codahale.metrics.Gauge;
+import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Meter;
+import com.codahale.metrics.Reservoir;
 import org.apache.cassandra.transport.ClientStat;
 import org.apache.cassandra.transport.ConnectedClient;
 import org.apache.cassandra.transport.Server;
@@ -39,6 +42,12 @@ public final class ClientMetrics
 
     private Meter authSuccess;
     private Meter authFailure;
+    private AtomicInteger pausedConnections;
+    
+    @SuppressWarnings({ "unused", "FieldCanBeLocal" })
+    private Gauge<Integer> pausedConnectionsGauge;
+    
+    private Meter requestDiscarded;
 
     private ClientMetrics()
     {
@@ -53,6 +62,11 @@ public final class ClientMetrics
     {
         authFailure.mark();
     }
+
+    public void pauseConnection() { pausedConnections.incrementAndGet(); }
+    public void unpauseConnection() { pausedConnections.decrementAndGet(); }
+
+    public void markRequestDiscarded() { requestDiscarded.mark(); }
 
     public List<ConnectedClient> allConnectedClients()
     {
@@ -71,13 +85,29 @@ public final class ClientMetrics
 
         this.servers = servers;
 
-        registerGauge("connectedNativeClients",       this::countConnectedClients);
-        registerGauge("connectedNativeClientsByUser", this::countConnectedClientsByUser);
-        registerGauge("connections",                  this::connectedClients);
-        registerGauge("clientsByProtocolVersion",     this::recentClientStats);
+        // deprecated the lower-cased initial letter metric names in 4.0
+        registerGauge("ConnectedNativeClients", "connectedNativeClients", this::countConnectedClients);
+        registerGauge("ConnectedNativeClientsByUser", "connectedNativeClientsByUser", this::countConnectedClientsByUser);
+        registerGauge("Connections", "connections", this::connectedClients);
+        registerGauge("ClientsByProtocolVersion", "clientsByProtocolVersion", this::recentClientStats);
+        registerGauge("RequestsSize", Server.EndpointPayloadTracker::getCurrentGlobalUsage);
+
+        Reservoir ipUsageReservoir = Server.EndpointPayloadTracker.ipUsageReservoir();
+        Metrics.register(factory.createMetricName("RequestsSizeByIpDistribution"),
+                         new Histogram(ipUsageReservoir)
+        {
+             public long getCount()
+             {
+                 return ipUsageReservoir.size();
+             }
+        });
 
         authSuccess = registerMeter("AuthSuccess");
         authFailure = registerMeter("AuthFailure");
+
+        pausedConnections = new AtomicInteger();
+        pausedConnectionsGauge = registerGauge("PausedConnections", pausedConnections::get);
+        requestDiscarded = registerMeter("RequestDiscarded");
 
         initialized = true;
     }
@@ -122,7 +152,7 @@ public final class ClientMetrics
 
         for (Server server : servers)
             for (ClientStat stat : server.recentClientStats())
-                stats.add(stat.asMap());
+                stats.add(new HashMap<>(stat.asMap())); // asMap returns guava, so need to convert to java for jmx
 
         stats.sort(Comparator.comparing(map -> map.get(ClientStat.PROTOCOL_VERSION)));
 
@@ -132,6 +162,12 @@ public final class ClientMetrics
     private <T> Gauge<T> registerGauge(String name, Gauge<T> gauge)
     {
         return Metrics.register(factory.createMetricName(name), gauge);
+    }
+    
+    private void registerGauge(String name, String deprecated, Gauge<?> gauge)
+    {
+        Gauge<?> registeredGauge = registerGauge(name, gauge);
+        Metrics.registerMBean(registeredGauge, factory.createMetricName(deprecated).getMBeanName());
     }
 
     private Meter registerMeter(String name)

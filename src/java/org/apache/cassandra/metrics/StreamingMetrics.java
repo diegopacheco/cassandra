@@ -39,16 +39,32 @@ public class StreamingMetrics
     public static final Counter activeStreamsOutbound = Metrics.counter(DefaultNameFactory.createMetricName(TYPE_NAME, "ActiveOutboundStreams", null));
     public static final Counter totalIncomingBytes = Metrics.counter(DefaultNameFactory.createMetricName(TYPE_NAME, "TotalIncomingBytes", null));
     public static final Counter totalOutgoingBytes = Metrics.counter(DefaultNameFactory.createMetricName(TYPE_NAME, "TotalOutgoingBytes", null));
+    public static final Counter totalOutgoingRepairBytes = Metrics.counter(DefaultNameFactory.createMetricName(TYPE_NAME, "TotalOutgoingRepairBytes", null));
+    public static final Counter totalOutgoingRepairSSTables = Metrics.counter(DefaultNameFactory.createMetricName(TYPE_NAME, "TotalOutgoingRepairSSTables", null));
     public final Counter incomingBytes;
     public final Counter outgoingBytes;
 
     public static StreamingMetrics get(InetAddressAndPort ip)
     {
+       /*
+         computeIfAbsent doesn't work for this situation. Since JMX metrics register themselves in their ctor, we need
+         to create the metric exactly once, otherwise we'll get duplicate name exceptions. Although computeIfAbsent is
+         thread safe in the context of the map, it uses compare and swap to add the computed value to the map. This
+         means it eagerly allocates new metric instances, which can cause the jmx name collision we're trying to avoid
+         if multiple calls interleave. So here we use synchronized to ensure we only instantiate metrics exactly once.
+        */
        StreamingMetrics metrics = instances.get(ip);
        if (metrics == null)
        {
-           metrics = new StreamingMetrics(ip);
-           instances.put(ip, metrics);
+           synchronized (instances)
+           {
+               metrics = instances.get(ip);
+               if (metrics == null)
+               {
+                   metrics = new StreamingMetrics(ip);
+                   instances.put(ip, metrics);
+               }
+           }
        }
        return metrics;
     }

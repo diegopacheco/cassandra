@@ -22,20 +22,19 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
+import java.util.Set;
 
+import com.google.common.collect.Sets;
 import com.google.common.primitives.Longs;
 
 import com.datastax.driver.core.BatchStatement;
 import com.datastax.driver.core.ConsistencyLevel;
 import com.datastax.driver.core.SimpleStatement;
 import com.datastax.driver.core.Statement;
-import org.apache.cassandra.audit.FullQueryLogger;
+import org.apache.cassandra.fql.FullQueryLogger;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
-import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.binlog.BinLog;
 
 public abstract class FQLQuery implements Comparable<FQLQuery>
@@ -102,8 +101,12 @@ public abstract class FQLQuery implements Comparable<FQLQuery>
                '}';
     }
 
+    public abstract boolean isDDLStatement();
+
     public static class Single extends FQLQuery
     {
+        private static final Set<String> DDL_STATEMENTS = Sets.newHashSet("CREATE", "ALTER", "DROP");
+
         public final String query;
         public final List<ByteBuffer> values;
 
@@ -117,10 +120,22 @@ public abstract class FQLQuery implements Comparable<FQLQuery>
         @Override
         public String toString()
         {
-            return String.format("%s%nQuery = %s, Values = %s",
+            return String.format("%s: Query: [%s], valuecount : %d",
                                  super.toString(),
                                  query,
-                                 values.stream().map(ByteBufferUtil::bytesToHex).collect(Collectors.joining(",")));
+                                 values.size());
+        }
+
+        public boolean isDDLStatement()
+        {
+            for (final String ddlStmt : DDL_STATEMENTS)
+            {
+                if (this.query.startsWith(ddlStmt))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         public Statement toStatement()
@@ -240,11 +255,16 @@ public abstract class FQLQuery implements Comparable<FQLQuery>
 
         public String toString()
         {
-            StringBuilder sb = new StringBuilder(super.toString()).append("\nbatch: ").append(batchType).append('\n');
+            StringBuilder sb = new StringBuilder(super.toString()).append(" batch: ").append(batchType).append(':');
             for (Single q : queries)
-                sb.append(q.toString()).append('\n');
+                sb.append(q.toString()).append(',');
             sb.append("end batch");
             return sb.toString();
+        }
+
+        public boolean isDDLStatement()
+        {
+            return false;
         }
 
         public boolean equals(Object o)

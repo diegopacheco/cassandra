@@ -26,6 +26,9 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Enumeration;
 
+
+import com.google.common.base.Throwables;
+import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -34,8 +37,10 @@ import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.exceptions.ConfigurationException;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 @RunWith(OrderedJUnit4ClassRunner.class)
 public class DatabaseDescriptorTest
@@ -201,6 +206,67 @@ public class DatabaseDescriptorTest
         DatabaseDescriptor.applyAddressConfig(testConfig);
 
     }
+
+    @Test
+    public void testInvalidPartition() throws Exception
+    {
+        Config testConfig = DatabaseDescriptor.loadConfig();
+        testConfig.partitioner = "ThisDoesNotExist";
+
+        try
+        {
+            DatabaseDescriptor.applyPartitioner(testConfig);
+            Assert.fail("Partition does not exist, so should fail");
+        }
+        catch (ConfigurationException e)
+        {
+            Assert.assertEquals("Invalid partitioner class ThisDoesNotExist", e.getMessage());
+            Throwable cause = Throwables.getRootCause(e);
+            Assert.assertNotNull("Unable to find root cause why partitioner was rejected", cause);
+            // this is a bit implementation specific, so free to change; mostly here to make sure reason isn't lost
+            Assert.assertEquals(ClassNotFoundException.class, cause.getClass());
+            Assert.assertEquals("org.apache.cassandra.dht.ThisDoesNotExist", cause.getMessage());
+        }
+    }
+
+    @Test
+    public void testInvalidPartitionPropertyOverride() throws Exception
+    {
+        String key = Config.PROPERTY_PREFIX + "partitioner";
+        String previous = System.getProperty(key);
+        try
+        {
+            System.setProperty(key, "ThisDoesNotExist");
+            Config testConfig = DatabaseDescriptor.loadConfig();
+            testConfig.partitioner = "Murmur3Partitioner";
+
+            try
+            {
+                DatabaseDescriptor.applyPartitioner(testConfig);
+                Assert.fail("Partition does not exist, so should fail");
+            }
+            catch (ConfigurationException e)
+            {
+                Assert.assertEquals("Invalid partitioner class ThisDoesNotExist", e.getMessage());
+                Throwable cause = Throwables.getRootCause(e);
+                Assert.assertNotNull("Unable to find root cause why partitioner was rejected", cause);
+                // this is a bit implementation specific, so free to change; mostly here to make sure reason isn't lost
+                Assert.assertEquals(ClassNotFoundException.class, cause.getClass());
+                Assert.assertEquals("org.apache.cassandra.dht.ThisDoesNotExist", cause.getMessage());
+            }
+        }
+        finally
+        {
+            if (previous == null)
+            {
+                System.getProperties().remove(key);
+            }
+            else
+            {
+                System.setProperty(key, previous);
+            }
+        }
+    }
     
     @Test
     public void testTokensFromString()
@@ -209,6 +275,57 @@ public class DatabaseDescriptorTest
         Collection<String> tokens = DatabaseDescriptor.tokensFromString(" a,b ,c , d, f,g,h");
         assertEquals(7, tokens.size());
         assertTrue(tokens.containsAll(Arrays.asList(new String[]{"a", "b", "c", "d", "f", "g", "h"})));
+    }
+
+    @Test
+    public void testExceptionsForInvalidConfigValues() {
+        try
+        {
+            DatabaseDescriptor.setColumnIndexCacheSize(-1);
+            fail("Should have received a ConfigurationException column_index_cache_size_in_kb = -1");
+        }
+        catch (ConfigurationException ignored) { }
+        Assert.assertEquals(2048, DatabaseDescriptor.getColumnIndexCacheSize());
+
+        try
+        {
+            DatabaseDescriptor.setColumnIndexCacheSize(2 * 1024 * 1024);
+            fail("Should have received a ConfigurationException column_index_cache_size_in_kb = 2GiB");
+        }
+        catch (ConfigurationException ignored) { }
+        Assert.assertEquals(2048, DatabaseDescriptor.getColumnIndexCacheSize());
+
+        try
+        {
+            DatabaseDescriptor.setColumnIndexSize(-1);
+            fail("Should have received a ConfigurationException column_index_size_in_kb = -1");
+        }
+        catch (ConfigurationException ignored) { }
+        Assert.assertEquals(4096, DatabaseDescriptor.getColumnIndexSize());
+
+        try
+        {
+            DatabaseDescriptor.setColumnIndexSize(2 * 1024 * 1024);
+            fail("Should have received a ConfigurationException column_index_size_in_kb = 2GiB");
+        }
+        catch (ConfigurationException ignored) { }
+        Assert.assertEquals(4096, DatabaseDescriptor.getColumnIndexSize());
+
+        try
+        {
+            DatabaseDescriptor.setBatchSizeWarnThresholdInKB(-1);
+            fail("Should have received a ConfigurationException batch_size_warn_threshold_in_kb = -1");
+        }
+        catch (ConfigurationException ignored) { }
+        Assert.assertEquals(5120, DatabaseDescriptor.getBatchSizeWarnThreshold());
+
+        try
+        {
+            DatabaseDescriptor.setBatchSizeWarnThresholdInKB(2 * 1024 * 1024);
+            fail("Should have received a ConfigurationException batch_size_warn_threshold_in_kb = 2GiB");
+        }
+        catch (ConfigurationException ignored) { }
+        Assert.assertEquals(4096, DatabaseDescriptor.getColumnIndexSize());
     }
 
     @Test
@@ -249,5 +366,140 @@ public class DatabaseDescriptorTest
         assertTrue(testConfig.cas_contention_timeout_in_ms == DatabaseDescriptor.LOWEST_ACCEPTED_TIMEOUT);
         assertTrue(testConfig.counter_write_request_timeout_in_ms == DatabaseDescriptor.LOWEST_ACCEPTED_TIMEOUT);
         assertTrue(testConfig.request_timeout_in_ms == DatabaseDescriptor.LOWEST_ACCEPTED_TIMEOUT);
+    }
+
+    @Test
+    public void testRepairSessionMemorySizeToggles()
+    {
+        int previousSize = DatabaseDescriptor.getRepairSessionSpaceInMegabytes();
+        try
+        {
+            Assert.assertEquals((Runtime.getRuntime().maxMemory() / (1024 * 1024) / 16),
+                                DatabaseDescriptor.getRepairSessionSpaceInMegabytes());
+
+            int targetSize = (int) (Runtime.getRuntime().maxMemory() / (1024 * 1024) / 4) + 1;
+
+            DatabaseDescriptor.setRepairSessionSpaceInMegabytes(targetSize);
+            Assert.assertEquals(targetSize, DatabaseDescriptor.getRepairSessionSpaceInMegabytes());
+
+            DatabaseDescriptor.setRepairSessionSpaceInMegabytes(10);
+            Assert.assertEquals(10, DatabaseDescriptor.getRepairSessionSpaceInMegabytes());
+
+            try
+            {
+                DatabaseDescriptor.setRepairSessionSpaceInMegabytes(0);
+                fail("Should have received a ConfigurationException for depth of 9");
+            }
+            catch (ConfigurationException ignored) { }
+
+            Assert.assertEquals(10, DatabaseDescriptor.getRepairSessionSpaceInMegabytes());
+        }
+        finally
+        {
+            DatabaseDescriptor.setRepairSessionSpaceInMegabytes(previousSize);
+        }
+    }
+
+    @Test
+    public void testRepairSessionSizeToggles()
+    {
+        int previousDepth = DatabaseDescriptor.getRepairSessionMaxTreeDepth();
+        try
+        {
+            Assert.assertEquals(20, DatabaseDescriptor.getRepairSessionMaxTreeDepth());
+            DatabaseDescriptor.setRepairSessionMaxTreeDepth(10);
+            Assert.assertEquals(10, DatabaseDescriptor.getRepairSessionMaxTreeDepth());
+
+            try
+            {
+                DatabaseDescriptor.setRepairSessionMaxTreeDepth(9);
+                fail("Should have received a ConfigurationException for depth of 9");
+            }
+            catch (ConfigurationException ignored) { }
+            Assert.assertEquals(10, DatabaseDescriptor.getRepairSessionMaxTreeDepth());
+
+            try
+            {
+                DatabaseDescriptor.setRepairSessionMaxTreeDepth(-20);
+                fail("Should have received a ConfigurationException for depth of -20");
+            }
+            catch (ConfigurationException ignored) { }
+            Assert.assertEquals(10, DatabaseDescriptor.getRepairSessionMaxTreeDepth());
+
+            DatabaseDescriptor.setRepairSessionMaxTreeDepth(22);
+            Assert.assertEquals(22, DatabaseDescriptor.getRepairSessionMaxTreeDepth());
+        }
+        finally
+        {
+            DatabaseDescriptor.setRepairSessionMaxTreeDepth(previousDepth);
+        }
+    }
+
+    @Test
+    public void testCalculateDefaultSpaceInMB()
+    {
+        // check prefered size is used for a small storage volume
+        int preferredInMB = 667;
+        int numerator = 2;
+        int denominator = 3;
+        int spaceInBytes = 999 * 1024 * 1024;
+
+        assertEquals(666, // total size is less than preferred, so return lower limit
+                     DatabaseDescriptor.calculateDefaultSpaceInMB("type", "/path", "setting_name", preferredInMB, spaceInBytes, numerator, denominator));
+
+        // check preferred size is used for a small storage volume
+        preferredInMB = 100;
+        numerator = 1;
+        denominator = 3;
+        spaceInBytes = 999 * 1024 * 1024;
+
+        assertEquals(100, // total size is more than preferred so keep the configured limit
+                     DatabaseDescriptor.calculateDefaultSpaceInMB("type", "/path", "setting_name", preferredInMB, spaceInBytes, numerator, denominator));
+    }
+
+    @Test
+    public void testConcurrentValidations()
+    {
+        Config conf = new Config();
+        conf.concurrent_compactors = 8;
+        // if concurrent_validations is < 1 (including being unset) it should default to concurrent_compactors
+        assertThat(conf.concurrent_validations).isLessThan(1);
+        DatabaseDescriptor.applyConcurrentValidations(conf);
+        assertThat(conf.concurrent_validations).isEqualTo(conf.concurrent_compactors);
+
+        // otherwise, it must be <= concurrent_compactors
+        conf.concurrent_validations = conf.concurrent_compactors + 1;
+        try
+        {
+            DatabaseDescriptor.applyConcurrentValidations(conf);
+            fail("Expected exception");
+        }
+        catch (ConfigurationException e)
+        {
+            assertThat(e.getMessage()).isEqualTo("To set concurrent_validations > concurrent_compactors, " +
+                                                 "set the system property cassandra.allow_unlimited_concurrent_validations=true");
+        }
+
+        // unless we disable that check (done with a system property at startup or via JMX)
+        DatabaseDescriptor.allowUnlimitedConcurrentValidations = true;
+        conf.concurrent_validations = conf.concurrent_compactors + 1;
+        DatabaseDescriptor.applyConcurrentValidations(conf);
+        assertThat(conf.concurrent_validations).isEqualTo(conf.concurrent_compactors + 1);
+    }
+
+    @Test
+    public void testRepairCommandPoolSize()
+    {
+        Config conf = new Config();
+        conf.concurrent_validations = 3;
+        // if repair_command_pool_size is < 1 (including being unset) it should default to concurrent_validations
+        assertThat(conf.repair_command_pool_size).isLessThan(1);
+        DatabaseDescriptor.applyRepairCommandPoolSize(conf);
+        assertThat(conf.repair_command_pool_size).isEqualTo(conf.concurrent_validations);
+
+        // but it can be overridden
+        conf.repair_command_pool_size = conf.concurrent_validations + 1;
+        DatabaseDescriptor.applyRepairCommandPoolSize(conf);
+        assertThat(conf.repair_command_pool_size).isEqualTo(conf.concurrent_validations + 1);
     }
 }

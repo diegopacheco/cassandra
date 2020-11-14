@@ -86,6 +86,11 @@ calculate_heap_sizes()
     fi
 }
 
+# Sets the path where logback and GC logs are written.
+if [ "x$CASSANDRA_LOG_DIR" = "x" ] ; then
+    CASSANDRA_LOG_DIR="$CASSANDRA_HOME/logs"
+fi
+
 #GC log path has to be defined here because it needs to access CASSANDRA_HOME
 if [ $JAVA_VERSION -ge 11 ] ; then
     # See description of https://bugs.openjdk.java.net/browse/JDK-8046148 for details about the syntax
@@ -93,16 +98,16 @@ if [ $JAVA_VERSION -ge 11 ] ; then
     echo "$JVM_OPTS" | grep -q "^-[X]log:gc"
     if [ "$?" = "1" ] ; then # [X] to prevent ccm from replacing this line
         # only add -Xlog:gc if it's not mentioned in jvm-server.options file
-        mkdir -p ${CASSANDRA_HOME}/logs
-        JVM_OPTS="$JVM_OPTS -Xlog:gc=info,heap*=trace,age*=debug,safepoint=info,promotion*=trace:file=${CASSANDRA_HOME}/logs/gc.log:time,uptime,pid,tid,level:filecount=10,filesize=10485760"
+        mkdir -p ${CASSANDRA_LOG_DIR}
+        JVM_OPTS="$JVM_OPTS -Xlog:gc=info,heap*=trace,age*=debug,safepoint=info,promotion*=trace:file=${CASSANDRA_LOG_DIR}/gc.log:time,uptime,pid,tid,level:filecount=10,filesize=10485760"
     fi
 else
     # Java 8
     echo "$JVM_OPTS" | grep -q "^-[X]loggc"
     if [ "$?" = "1" ] ; then # [X] to prevent ccm from replacing this line
         # only add -Xlog:gc if it's not mentioned in jvm-server.options file
-        mkdir -p ${CASSANDRA_HOME}/logs
-        JVM_OPTS="$JVM_OPTS -Xloggc:${CASSANDRA_HOME}/logs/gc.log"
+        mkdir -p ${CASSANDRA_LOG_DIR}
+        JVM_OPTS="$JVM_OPTS -Xloggc:${CASSANDRA_LOG_DIR}/gc.log"
     fi
 fi
 
@@ -115,7 +120,7 @@ echo $JVM_OPTS | grep -q Xms
 DEFINED_XMS=$?
 echo $JVM_OPTS | grep -q UseConcMarkSweepGC
 USING_CMS=$?
-echo $JVM_OPTS | grep -q UseG1GC
+echo $JVM_OPTS | grep -q +UseG1GC
 USING_G1=$?
 
 # Override these to set the amount of memory to allocate to the JVM at
@@ -169,6 +174,13 @@ if [ $DEFINED_XMN -eq 0 ] && [ $DEFINED_XMX -ne 0 ]; then
     exit 1
 elif [ $DEFINED_XMN -ne 0 ] && [ $USING_CMS -eq 0 ]; then
     JVM_OPTS="$JVM_OPTS -Xmn${HEAP_NEWSIZE}"
+fi
+
+# We fail to start if -Xmn is used with G1 GC is being used
+# See comments for -Xmn in jvm-server.options
+if [ $DEFINED_XMN -eq 0 ] && [ $USING_G1 -eq 0 ]; then
+    echo "It is not recommended to set -Xmn with the G1 garbage collector. See comments for -Xmn in jvm-server.options for details."
+    exit 1
 fi
 
 if [ "$JVM_ARCH" = "64-Bit" ] && [ $USING_CMS -eq 0 ]; then
@@ -255,7 +267,7 @@ JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.password.file=/etc/cassandra/
 ## which delegates to the IAuthenticator configured in cassandra.yaml. See the sample JAAS configuration
 ## file cassandra-jaas.config
 #JVM_OPTS="$JVM_OPTS -Dcassandra.jmx.remote.login.config=CassandraLogin"
-#JVM_OPTS="$JVM_OPTS -Djava.security.auth.login.config=$CASSANDRA_HOME/conf/cassandra-jaas.config"
+#JVM_OPTS="$JVM_OPTS -Djava.security.auth.login.config=$CASSANDRA_CONF/cassandra-jaas.config"
 
 ## Cassandra also ships with a helper for delegating JMX authz calls to the configured IAuthorizer,
 ## uncomment this to use it. Requires one of the two authentication options to be enabled
@@ -263,7 +275,7 @@ JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.password.file=/etc/cassandra/
 
 # To use mx4j, an HTML interface for JMX, add mx4j-tools.jar to the lib/
 # directory.
-# See http://wiki.apache.org/cassandra/Operations#Monitoring_with_MX4J
+# See http://cassandra.apache.org/doc/latest/operating/metrics.html#jmx
 # By default mx4j listens on 0.0.0.0:8081. Uncomment the following lines
 # to control its listen address and port.
 #MX4J_ADDRESS="127.0.0.1"

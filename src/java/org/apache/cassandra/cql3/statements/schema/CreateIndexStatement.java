@@ -19,11 +19,13 @@ package org.apache.cassandra.cql3.statements.schema;
 
 import java.util.*;
 
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 
 import org.apache.cassandra.audit.AuditLogContext;
 import org.apache.cassandra.audit.AuditLogEntryType;
 import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.QualifiedName;
@@ -31,6 +33,7 @@ import org.apache.cassandra.cql3.statements.schema.IndexTarget.Type;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.marshal.MapType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.sasi.SASIIndex;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.service.ClientState;
@@ -67,6 +70,9 @@ public final class CreateIndexStatement extends AlterSchemaStatement
     public Keyspaces apply(Keyspaces schema)
     {
         attrs.validate();
+
+        if (attrs.isCustom && attrs.customClass.equals(SASIIndex.class.getName()) && !DatabaseDescriptor.getEnableSASIIndexes())
+            throw new InvalidRequestException("SASI indexes are disabled. Enable in cassandra.yaml to use.");
 
         KeyspaceMetadata keyspace = schema.getNullable(keyspaceName);
         if (null == keyspace)
@@ -135,6 +141,15 @@ public final class CreateIndexStatement extends AlterSchemaStatement
         return schema.withAddedOrUpdated(keyspace.withSwapped(keyspace.tables.withSwapped(newTable)));
     }
 
+    @Override
+    Set<String> clientWarnings(KeyspacesDiff diff)
+    {
+        if (attrs.isCustom && attrs.customClass.equals(SASIIndex.class.getName()))
+            return ImmutableSet.of(SASIIndex.USAGE_WARNING);
+
+        return ImmutableSet.of();
+    }
+
     private void validateIndexTarget(TableMetadata table, IndexTarget target)
     {
         ColumnMetadata column = table.getColumn(target.column);
@@ -156,11 +171,21 @@ public final class CreateIndexStatement extends AlterSchemaStatement
             throw ire("Secondary indexes are not supported on duration columns");
         }
 
+        if (table.isCompactTable())
+        {
+            TableMetadata.CompactTableMetadata compactTable = (TableMetadata.CompactTableMetadata) table;
+            if (column.isPrimaryKeyColumn())
+                throw new InvalidRequestException("Secondary indexes are not supported on PRIMARY KEY columns in COMPACT STORAGE tables");
+            if (compactTable.compactValueColumn.equals(column))
+                throw new InvalidRequestException("Secondary indexes are not supported on compact value column of COMPACT STORAGE tables");
+        }
+
         if (column.isPartitionKey() && table.partitionKeyColumns().size() == 1)
             throw ire("Cannot create secondary index on the only partition key column %s", column);
 
         if (column.type.isFrozenCollection() && target.type != Type.FULL)
-            throw ire("Cannot create %s() index on frozen column %s. Frozen collections only support full() indexes", target.type, column);
+            throw ire("Cannot create %s() index on frozen column %s. Frozen collections are immutable and must be fully " +
+                      "indexed by using the 'full(%s)' modifier", target.type, column, column);
 
         if (!column.type.isFrozenCollection() && target.type == Type.FULL)
             throw ire("full() indexes can only be created on frozen collections");

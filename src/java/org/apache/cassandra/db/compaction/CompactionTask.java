@@ -37,7 +37,6 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.SystemKeyspace;
-import org.apache.cassandra.db.compaction.CompactionManager.CompactionExecutorStatsCollector;
 import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
 import org.apache.cassandra.db.compaction.writers.DefaultCompactionWriter;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
@@ -53,7 +52,7 @@ public class CompactionTask extends AbstractCompactionTask
     protected final int gcBefore;
     protected final boolean keepOriginals;
     protected static long totalBytesCompacted = 0;
-    private CompactionExecutorStatsCollector collector;
+    private ActiveCompactionsTracker activeCompactions;
 
     public CompactionTask(ColumnFamilyStore cfs, LifecycleTransaction txn, int gcBefore)
     {
@@ -78,9 +77,9 @@ public class CompactionTask extends AbstractCompactionTask
         return totalBytesCompacted += bytesCompacted;
     }
 
-    protected int executeInternal(CompactionExecutorStatsCollector collector)
+    protected int executeInternal(ActiveCompactionsTracker activeCompactions)
     {
-        this.collector = collector;
+        this.activeCompactions = activeCompactions == null ? ActiveCompactionsTracker.NOOP : activeCompactions;
         run();
         return transaction.originals().size();
     }
@@ -154,7 +153,7 @@ public class CompactionTask extends AbstractCompactionTask
             }
             ssTableLoggerMsg.append("]");
 
-            logger.debug("Compacting ({}) {}", taskId, ssTableLoggerMsg);
+            logger.info("Compacting ({}) {}", taskId, ssTableLoggerMsg);
 
             RateLimiter limiter = CompactionManager.instance.getRateLimiter();
             long start = System.nanoTime();
@@ -185,14 +184,15 @@ public class CompactionTask extends AbstractCompactionTask
 
                 long lastBytesScanned = 0;
 
-                if (!controller.cfs.getCompactionStrategyManager().isActive())
-                    throw new CompactionInterruptedException(ci.getCompactionInfo());
-
-                if (collector != null)
-                    collector.beginCompaction(ci);
-
+                activeCompactions.beginCompaction(ci);
                 try (CompactionAwareWriter writer = getCompactionAwareWriter(cfs, getDirectories(), transaction, actuallyCompact))
                 {
+                    // Note that we need to re-check this flag after calling beginCompaction above to avoid a window
+                    // where the compaction does not exist in activeCompactions but the CSM gets paused.
+                    // We already have the sstables marked compacting here so CompactionManager#waitForCessation will
+                    // block until the below exception is thrown and the transaction is cancelled.
+                    if (!controller.cfs.getCompactionStrategyManager().isActive())
+                        throw new CompactionInterruptedException(ci.getCompactionInfo());
                     estimatedKeys = writer.estimatedKeys();
                     while (ci.hasNext())
                     {
@@ -219,11 +219,8 @@ public class CompactionTask extends AbstractCompactionTask
                 }
                 finally
                 {
-                    if (collector != null)
-                        collector.finishCompaction(ci);
-
+                    activeCompactions.finishCompaction(ci);
                     mergedRowCounts = ci.getMergedRowCounts();
-
                     totalSourceCQLRows = ci.getTotalSourceCQLRows();
                 }
             }
@@ -251,22 +248,21 @@ public class CompactionTask extends AbstractCompactionTask
 
                 String mergeSummary = updateCompactionHistory(cfs.keyspace.getName(), cfs.getTableName(), mergedRowCounts, startsize, endsize);
 
-                if (logger.isDebugEnabled())
-                    logger.debug(String.format("Compacted (%s) %d sstables to [%s] to level=%d.  %s to %s (~%d%% of original) in %,dms.  Read Throughput = %s, Write Throughput = %s, Row Throughput = ~%,d/s.  %,d total partitions merged to %,d.  Partition merge counts were {%s}",
-                                               taskId,
-                                               transaction.originals().size(),
-                                               newSSTableNames.toString(),
-                                               getLevel(),
-                                               FBUtilities.prettyPrintMemory(startsize),
-                                               FBUtilities.prettyPrintMemory(endsize),
-                                               (int) (ratio * 100),
-                                               dTime,
-                                               FBUtilities.prettyPrintMemoryPerSecond(startsize, durationInNano),
-                                               FBUtilities.prettyPrintMemoryPerSecond(endsize, durationInNano),
-                                               (int) totalSourceCQLRows / (TimeUnit.NANOSECONDS.toSeconds(durationInNano) + 1),
-                                               totalSourceRows,
-                                               totalKeysWritten,
-                                               mergeSummary));
+                logger.info(String.format("Compacted (%s) %d sstables to [%s] to level=%d.  %s to %s (~%d%% of original) in %,dms.  Read Throughput = %s, Write Throughput = %s, Row Throughput = ~%,d/s.  %,d total partitions merged to %,d.  Partition merge counts were {%s}",
+                                           taskId,
+                                           transaction.originals().size(),
+                                           newSSTableNames.toString(),
+                                           getLevel(),
+                                           FBUtilities.prettyPrintMemory(startsize),
+                                           FBUtilities.prettyPrintMemory(endsize),
+                                           (int) (ratio * 100),
+                                           dTime,
+                                           FBUtilities.prettyPrintMemoryPerSecond(startsize, durationInNano),
+                                           FBUtilities.prettyPrintMemoryPerSecond(endsize, durationInNano),
+                                           (int) totalSourceCQLRows / (TimeUnit.NANOSECONDS.toSeconds(durationInNano) + 1),
+                                           totalSourceRows,
+                                           totalKeysWritten,
+                                           mergeSummary));
                 if (logger.isTraceEnabled())
                 {
                     logger.trace("CF Total Bytes Compacted: {}", FBUtilities.prettyPrintMemory(CompactionTask.addToTotalBytesCompacted(endsize)));

@@ -21,6 +21,7 @@ import java.io.FileNotFoundException;
 import java.net.SocketException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -32,6 +33,7 @@ import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.service.StorageService;
 
 /**
@@ -45,6 +47,9 @@ public final class JVMStabilityInspector
     private static Object lock = new Object();
     private static boolean printingHeapHistogram;
 
+    // It is used for unit test
+    public static OnKillHook killerHook;
+
     private JVMStabilityInspector() {}
 
     /**
@@ -53,7 +58,30 @@ public final class JVMStabilityInspector
      * @param t
      *      The Throwable to check for server-stop conditions
      */
-    public static void inspectThrowable(Throwable t)
+    public static void inspectThrowable(Throwable t) throws OutOfMemoryError
+    {
+        inspectThrowable(t, true);
+    }
+
+    public static void inspectThrowable(Throwable t, boolean propagateOutOfMemory) throws OutOfMemoryError
+    {
+        inspectThrowable(t, propagateOutOfMemory, JVMStabilityInspector::inspectDiskError);
+    }
+
+    public static void inspectCommitLogThrowable(Throwable t)
+    {
+        inspectThrowable(t, true, JVMStabilityInspector::inspectCommitLogError);
+    }
+
+    private static void inspectDiskError(Throwable t)
+    {
+        if (t instanceof CorruptSSTableException)
+            FileUtils.handleCorruptSSTable((CorruptSSTableException) t);
+        else if (t instanceof FSError)
+            FileUtils.handleFSError((FSError) t);
+    }
+
+    public static void inspectThrowable(Throwable t, boolean propagateOutOfMemory, Consumer<Throwable> fn) throws OutOfMemoryError
     {
         boolean isUnstable = false;
         if (t instanceof OutOfMemoryError)
@@ -76,12 +104,17 @@ public final class JVMStabilityInspector
             StorageService.instance.removeShutdownHook();
             // We let the JVM handle the error. The startup checks should have warned the user if it did not configure
             // the JVM behavior in case of OOM (CASSANDRA-13006).
+            if (!propagateOutOfMemory)
+                return;
+
             throw (OutOfMemoryError) t;
         }
 
         if (DatabaseDescriptor.getDiskFailurePolicy() == Config.DiskFailurePolicy.die)
             if (t instanceof FSError || t instanceof CorruptSSTableException)
-            isUnstable = true;
+                isUnstable = true;
+
+        fn.accept(t);
 
         // Check for file handle exhaustion
         if (t instanceof FileNotFoundException || t instanceof SocketException)
@@ -92,10 +125,10 @@ public final class JVMStabilityInspector
             killer.killCurrentJVM(t);
 
         if (t.getCause() != null)
-            inspectThrowable(t.getCause());
+            inspectThrowable(t.getCause(), propagateOutOfMemory, fn);
     }
 
-    public static void inspectCommitLogThrowable(Throwable t)
+    private static void inspectCommitLogError(Throwable t)
     {
         if (!StorageService.instance.isDaemonSetupCompleted())
         {
@@ -104,8 +137,6 @@ public final class JVMStabilityInspector
         }
         else if (DatabaseDescriptor.getCommitFailurePolicy() == Config.CommitFailurePolicy.die)
             killer.killCurrentJVM(t);
-        else
-            inspectThrowable(t);
     }
 
     public static void killCurrentJVM(Throwable t, boolean quiet)
@@ -161,11 +192,26 @@ public final class JVMStabilityInspector
                 t.printStackTrace(System.err);
                 logger.error("JVM state determined to be unstable.  Exiting forcefully due to:", t);
             }
-            if (killing.compareAndSet(false, true))
+
+            boolean doExit = killerHook != null ? killerHook.execute(t) : true;
+
+            if (doExit && killing.compareAndSet(false, true))
             {
                 StorageService.instance.removeShutdownHook();
                 System.exit(100);
             }
         }
+    }
+
+    /**
+     * This class is usually used to avoid JVM exit when running junit tests.
+     */
+    public interface OnKillHook
+    {
+        /**
+         *
+         * @return False will skip exit
+         */
+        boolean execute(Throwable t);
     }
 }
